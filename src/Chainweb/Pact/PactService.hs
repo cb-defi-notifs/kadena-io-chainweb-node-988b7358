@@ -802,11 +802,9 @@ execLookupPactTxs restorePoint confDepth txs
     | otherwise = go
   where
     go = getCheckpointer >>= \(!cp) -> case restorePoint of
-      NoRewind _ ->
-        liftIO $! _cpLookupProcessedTx cp confDepth txs
       DoRewind parent -> withDiscardedBatch $ do
         withCheckpointerRewind Nothing (Just $ ParentHeader parent) "lookupPactTxs" $ \_ ->
-          liftIO $ Discard <$> _cpLookupProcessedTx cp confDepth txs
+          liftIO $ Discard <$> _cpLookupProcessedTx cp (_blockHeight parent) confDepth txs
 
 -- | Modified table gas module with free module loads
 --
