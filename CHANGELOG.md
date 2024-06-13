@@ -1,4 +1,249 @@
-# `chainweb-node` Changelog
+# 2.24 (2024-05-23)
+This version replaces all previous versions. Any prior version will stop working
+on **2024-05-29T00:00:00Z**. Node administrators must upgrade to this version
+before that date. The 2.24 feature upgrade will occur at block height 4,819,246
+which is estimated to be mined at **2024-05-30T00:00:00Z**.
+
+This version will expire on **2024-08-21T00:00:00Z**.
+
+To upgrade, pull the latest docker image or download the binary and restart the node.
+
+Changes:
+- Transactions with expired TTLs and transactions with creation times in the
+  future now yield different errors (#1868)
+
+- Buying and redeeming gas were optimized, meaning all transactions now
+  require less space in the Pact state and take slightly less time (#1886)
+
+- Block payloads (i.e. transactions and their outputs) are now stored in a more
+  space-efficient binary format. They are also now indexed by block height in
+  addition to hash, improving overall performance of the payload store by
+  increasing data locality. Payloads already in the node's database will not
+  be automatically migrated; this change only applies to newly written payloads.
+
+  A migration tool may be released in future.
+  (#1885)
+
+- Nodes configured to run without contacting any other nodes now log this more
+  accurately (#1914)
+
+- Add a flag `--full-historic-pact-state` which is set by default. This flag
+  disallows use of a compacted Pact state. Unsetting this flag will not compact
+  the Pact state automatically, but it will decrease the amount of disk space
+  used by the Pact state in subsequent transactions to some extent. (#1910)
+
+- Add "allow" verifier to devnet, to allow testing verifier plugin integrations
+  in third-party tools (#1896)
+
+Internal changes:
+- Add a CLI flag for executing non-destructive replays of Pact history, to
+  augment the already existing config file field (#1915)
+- Pact requests are now cancellable, even before they start, and the interface
+  to the Pact service is now easier to use (#1871)
+- Mined blocks that fail validation on the mining node produce better errors
+  including the outputs of the block from when it was created (#1888)
+- Fix the block validation to correctly log the number of fork blocks played
+  (#1904, #1874)
+- Make tests more repeatable (#1902, #1903)
+- Make some tests faster (#1866, #1897)
+- Module cache contents should now be irrelevant to block validation, making
+  block validation less brittle (#1872)
+- Move some log messages from Info level to Debug level making it
+  more useful to run a node at log level Info with telemetry disabled (#1874)
+- cwtool is now included in the docker image produced by CI allowing
+  administrators to use it more easily (#1887)
+- The coin contract directory structure was reorganized to match the directory
+  structure of the namespace contract for ease of maintenance (#1892)
+
+## 2.23.2 (2024-03-19)
+This is a minor point release. Upgrading is recommended.
+
+To upgrade, pull the latest docker image or download the binary and restart the node.
+
+Changes:
+- Fix catchup for nodes started at blocks before the service date (#1860)
+
+Internal changes:
+- Fix a small internal bug in the new read-only checkpointer (#1857)
+- Fix a small bug in compaction tests, causing flakiness (#1855)
+
+## 2.23.1 (2024-03-08)
+This is a minor point release. Mining nodes should be upgraded as soon as
+possible; for other nodes, upgrading is recommended.
+
+To upgrade, pull the latest docker image or download the binary and restart the node.
+
+Changes:
+- The mining loop will more persistently attempt to create new block payloads. (#1851)
+- The service date for `chainweb-node` is now only respected on Mainnet and
+  Testnet. (#1843)
+
+Internal changes:
+- The pact `/listen` endpoint should take less memory and CPU time. (#1844)
+- Fix some invalid log messages. (#1850, #1852)
+- Various tests have been "deflaked", to hopefully make them more reliable. (#1848, #1849)
+
+## 2.23 (2024-03-03)
+This version replaces all previous versions. Any prior version will stop working
+on **2024-03-06T00:00:00Z**. Node administrators must upgrade to this version
+before that date. The 2.23 feature upgrade will occur at block height 4,577,530
+which is estimated to be mined at **2024-03-07T00:00:00Z**.
+
+This version will expire on **2024-05-29T00:00:00Z**.
+
+To upgrade, pull the latest docker image or download the binary and restart the node.
+
+Changes:
+- Updated to Pact 4.11: https://github.com/kadena-io/pact/releases/tag/v4.11.0
+- The `coin` contract was updated to version 6, implementing KIP-0022 (#1807)
+- Pact "verifier plugins" are now available, implementing KIP-0028 (#1777)
+- Fix a bug where nodes could take too long to start up if they took too long to
+  rewind to their latest cut. (#1791)
+- Rename two user-visible network IDs (#1810)
+  - `development` was renamed to `recap-development`
+  - `fast-development` was renamed to `development`
+- Running a node and making queries to `/local` should be much faster when the
+  `?rewindDepth` query parameter is provided.
+- Introduced new `--enable-local-timeout` (or `chainweb.enableLocalTimeout`)
+  configuration option to enable a timeout for `/local` queries. This is
+  disabled by default. (#1838)
+- New REST API endpoint features (#1800):
+  - The `/payload` GET endpoint now:
+    - Takes a `?height` query parameter, allowing you to specify the block
+      height of the payload you are querying. This parameter will become
+      mandatory in the future.
+    - The batch query endpoint now supports submitting block heights along with
+      their hashes. Instead of submitting a list of hashes, submit a JSON object
+      such as:
+
+      ```
+      { "hashes": ["hash1", "hash2", "hash3"], "heights": [1, 2, 3] }
+      ```
+
+      See the Chainweb OpenAPI specification for more information on how to use
+      this feature. This parameter will become mandatory in the future.
+  - The `/payload/outputs` POST endpoint now:
+    - Takes a `?height` query parameter, allowing you to specify the block
+      height of the payload you are querying. This parameter will become
+      mandatory in the future.
+    - The batch query endpoint now supports submitting block heights along with
+      their hashes. Instead of submitting a list of hashes, submit a JSON object
+      such as:
+
+
+      ```
+      { "hashes": ["hash1", "hash2", "hash3"], "heights": [1, 2, 3] }
+      ```
+
+      See the Chainweb OpenAPI specification for more information on how to use
+      this feature. This parameter will become mandatory in the future.
+
+Upcoming features:
+- Internal reworks to support a new, more efficient storage format for block
+  payloads (#1800)
+  - This new format is not complete, and will appear in a future release.
+  - In the mean time, this has enabled the `/payload` API changes mentioned above.
+- Major internal reworks for an upcoming feature known as _compaction_ which
+  will help reduce the amount of storage space for chainweb. (#1793, #1792,
+  #1812, #1820)
+  - **Compaction IS NOT STABLE**
+  - Usage of "compacted nodes" or tools is **NOT** currently supported
+
+Internal Changes:
+- Major scalability improvements to core "checkpointing" infrastructure, allowing
+  faster full-chain replays and other operations (#1803, #1804)
+- Update RocksDB build to 8.3.2 (#1738)
+- Migrate to a unified Nix flake for Haskell developers on Chainweb (#1778)
+- Fix some perfectly benign, but scary warning messages, when compiling Chainweb
+  (#1779)
+- Several changes to address various test "flakes" and internal test
+  infrastructure improvements (#1811, #1822, #1813, #1814, #1816, et cetera)
+- Better logging in the mining loop (#1766)
+
+## 2.22 (2023-11-24)
+This version replaces all previous versions. Any prior version will stop working
+on **2023-12-13T00:00:00Z**. Node administrators must upgrade to this version before
+that date.
+
+This version will expire on **2023-03-06T:00:00Z**.
+
+To upgrade, pull the latest docker image or download the binary and restart the node.
+
+Changes:
+
+* Updated to Pact 4.10 (numerous, see [Pact
+  changelog](https://github.com/kadena-io/pact/releases/tag/v4.10))
+* Node support for webauthn signers, scoped signatures, and webauthn keyset formats in Pact (#1779)
+* Block endpoint added to Service API (#1720)
+* Fix batch /polling so that it no longer omits results (#1775)
+* Add block header to validation failure message (#1752)
+* Halt block fill algorithm constructively if we exceeded the tx fetch limit (#1762)
+* Be more careful not to write the results of invalid blocks to the pact state (#1740)
+* Fix Mac M2 compatibility with older blocks (#1782)
+
+Internal Changes:
+* Support aeson-2.2 (#1750)
+* Fix benchmarks for block creation and validation (#1767)
+
+## 2.21 (2023-10-05)
+
+This version replaces all previous versions. Any prior version will stop working
+on **2023-10-19T00:00:00Z**. Node administrators must upgrade to this version before
+that date.
+
+This version will expire on **2023-12-13T:00:00Z**.
+
+To upgrade, pull the latest docker image or download the binary and restart the node.
+
+Changes:
+
+* Support for WebAuthN signatures in Pact keyset guards. (#1729, see [https://github.com/kadena-io/pact](Pact) #1139)
+* Updated to Pact 4.9. (numerous, see [Pact
+  changelog](https://github.com/kadena-io/pact/releases/tag/v4.9))
+
+Internal Changes:
+* Updated from tls package version 1.7.1 to 1.9. (#1734)
+* Updated from base64-bytestring package version 1.0.0.3 to 1.2.1.0. (#1729)
+
+## 2.20 (2023-08-28)
+
+This version replaces all previous versions. Any prior version will stop working
+on **2023-09-07T00:00:00Z**. Node administrators must upgrade to this version before
+that date.
+
+This version will expire on **2023-10-19T00:00:00Z**.
+
+To upgrade, pull the latest docker image or download the binary and restart the node.
+
+Changes:
+
+* A new chainwebVersion called fast-development, intended for use by Pact
+  developers. See #1627 for more details.
+* Updated to Pact 4.8. (numerous, see [Pact
+  changelog](https://github.com/kadena-io/pact/releases/tag/v4.8))
+* Fixed an issue where /local calls that rewind to a previous block could have
+  the wrong behavior or gas usage if rewinding crosses fork boundaries. (#1700)
+
+Internal Changes:
+* Updated from GHC 8.10.7 to GHC 9.6.2. (#1565)
+* PactService now emits significantly more structured logs. (#1699)
+
+## 2.19.2 (2023-07-17)
+
+**NOTE: THIS VERSION SUPERSEDES 2.19.1. PLEASE UPDATE AS SOON AS POSSIBLE.**
+
+This version replaces all previous versions.
+
+This version will expire on 2023-09-07.
+
+To upgrade, pull the latest docker image or download the binary and restart the node.
+
+Changes:
+
+*   Add rewind support to /poll and /local. (#1653, #1686)
+*   Add some leniency to mempool creation time checks. (#1255)
+*   Return metadata from /local with preflight set to true. (#1612)
+*   Optimize new block creation. (#1691)
 
 ## 2.19.1 (2023-05-22)
 
@@ -16,7 +261,7 @@ Changes:
 *   Disable user function return value typechecking (#1661)
 *   Add typechecking option to tx-sim. (#1656)
 
-## 2.19 (2023-05-25)
+## 2.19 (2023-05-17)
 
 **NOTE: THIS VERSION IS OBSOLETE. IT IS REPLACED BY 2.19.1. PLEASE UPDATE AS SOON
 AS POSSIBLE.**

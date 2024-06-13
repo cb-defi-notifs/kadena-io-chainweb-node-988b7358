@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveGeneric #-}
@@ -30,6 +31,10 @@ module Chainweb.Version
     (
     -- * Properties of Chainweb Version
       Fork(..)
+    , ForkHeight(..)
+    , _ForkAtBlockHeight
+    , _ForkAtGenesis
+    , _ForkNever
     , VersionGenesis(..)
     , VersionCheats(..)
     , VersionDefaults(..)
@@ -45,8 +50,11 @@ module Chainweb.Version
     , ChainwebVersion(..)
     , Upgrade(..)
     , upgrade
+    , VersionQuirks(..)
+    , noQuirks
+    , quirkGasFees
     , versionForks
-    , versionBlockRate
+    , versionBlockDelay
     , versionCheats
     , versionDefaults
     , versionUpgrades
@@ -58,6 +66,8 @@ module Chainweb.Version
     , versionName
     , versionWindow
     , versionGenesis
+    , versionVerifierPluginNames
+    , versionQuirks
     , genesisBlockPayload
     , genesisBlockPayloadHash
     , genesisBlockTarget
@@ -108,7 +118,7 @@ module Chainweb.Version
     , checkAdjacentChainIds
 
     -- ** Utilities for constructing Chainweb Version
-    , forkUpgrades
+    , indexByForkHeights
     , latestBehaviorAt
     , domainAddr2PeerInfo
 
@@ -128,6 +138,7 @@ import Data.Hashable
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HM
 import qualified Data.HashSet as HS
+import Data.Set(Set)
 import Data.Proxy
 import qualified Data.Text as T
 import Data.Word
@@ -135,9 +146,10 @@ import Data.Word
 import GHC.Generics(Generic)
 import GHC.TypeLits
 
-import Numeric.Natural
-
 -- internal modules
+
+import Pact.Types.Command (RequestKey)
+import Pact.Types.Runtime (Gas)
 
 import Chainweb.BlockCreationTime
 import Chainweb.BlockHeight
@@ -152,6 +164,8 @@ import Chainweb.Transaction
 import Chainweb.Utils
 import Chainweb.Utils.Rule
 import Chainweb.Utils.Serialization
+
+import Pact.Types.Verifier
 
 import Data.Singletons
 
@@ -176,7 +190,7 @@ data Fork
     | SPVBridge
     | Pact4Coin3
     | EnforceKeysetFormats
-    | Pact420
+    | Pact42
     | CheckTxHash
     | Chainweb213Pact
     | Chainweb214Pact
@@ -186,6 +200,12 @@ data Fork
     | Chainweb217Pact
     | Chainweb218Pact
     | Chainweb219Pact
+    | Chainweb220Pact
+    | Chainweb221Pact
+    | Chainweb222Pact
+    | Chainweb223Pact
+    | Chainweb224Pact
+    | Chainweb225Pact
     -- always add new forks at the end, not in the middle of the constructors.
     deriving stock (Bounded, Generic, Eq, Enum, Ord, Show)
     deriving anyclass (NFData, Hashable)
@@ -205,7 +225,7 @@ instance HasTextRepresentation Fork where
     toText SPVBridge = "spvBridge"
     toText Pact4Coin3 = "pact4Coin3"
     toText EnforceKeysetFormats = "enforceKeysetFormats"
-    toText Pact420 = "pact420"
+    toText Pact42 = "Pact42"
     toText CheckTxHash = "checkTxHash"
     toText Chainweb213Pact = "chainweb213Pact"
     toText Chainweb214Pact = "chainweb214Pact"
@@ -215,6 +235,12 @@ instance HasTextRepresentation Fork where
     toText Chainweb217Pact = "chainweb217Pact"
     toText Chainweb218Pact = "chainweb218Pact"
     toText Chainweb219Pact = "chainweb219Pact"
+    toText Chainweb220Pact = "chainweb220Pact"
+    toText Chainweb221Pact = "chainweb221Pact"
+    toText Chainweb222Pact = "chainweb222Pact"
+    toText Chainweb223Pact = "chainweb223Pact"
+    toText Chainweb224Pact = "chainweb224Pact"
+    toText Chainweb225Pact = "chainweb225Pact"
 
     fromText "slowEpoch" = return SlowEpoch
     fromText "vuln797Fix" = return Vuln797Fix
@@ -230,7 +256,7 @@ instance HasTextRepresentation Fork where
     fromText "spvBridge" = return SPVBridge
     fromText "pact4Coin3" = return Pact4Coin3
     fromText "enforceKeysetFormats" = return EnforceKeysetFormats
-    fromText "pact420" = return Pact420
+    fromText "Pact42" = return Pact42
     fromText "checkTxHash" = return CheckTxHash
     fromText "chainweb213Pact" = return Chainweb213Pact
     fromText "chainweb214Pact" = return Chainweb214Pact
@@ -240,6 +266,12 @@ instance HasTextRepresentation Fork where
     fromText "chainweb217Pact" = return Chainweb217Pact
     fromText "chainweb218Pact" = return Chainweb218Pact
     fromText "chainweb219Pact" = return Chainweb219Pact
+    fromText "chainweb220Pact" = return Chainweb220Pact
+    fromText "chainweb221Pact" = return Chainweb221Pact
+    fromText "chainweb222Pact" = return Chainweb222Pact
+    fromText "chainweb223Pact" = return Chainweb223Pact
+    fromText "chainweb224Pact" = return Chainweb224Pact
+    fromText "chainweb225Pact" = return Chainweb225Pact
     fromText t = throwM . TextFormatException $ "Unknown Chainweb fork: " <> t
 
 instance ToJSON Fork where
@@ -250,6 +282,12 @@ instance FromJSON Fork where
     parseJSON = parseJsonFromText "Fork"
 instance FromJSONKey Fork where
     fromJSONKey = FromJSONKeyTextParser $ either fail return . eitherFromText
+
+data ForkHeight = ForkAtBlockHeight !BlockHeight | ForkAtGenesis | ForkNever
+    deriving stock (Generic, Eq, Ord, Show)
+    deriving anyclass (Hashable, NFData)
+
+makePrisms ''ForkHeight
 
 newtype ChainwebVersionName =
     ChainwebVersionName { getChainwebVersionName :: T.Text }
@@ -290,12 +328,33 @@ data Upgrade = Upgrade
     deriving stock (Generic, Eq)
     deriving anyclass (NFData)
 
+instance Show Upgrade where
+    show _ = "<upgrade>"
+
 upgrade :: [ChainwebTransaction] -> Upgrade
 upgrade txs = Upgrade txs False
 
+-- The type of quirks, i.e. special validation behaviors that are in some
+-- sense one-offs which can't be expressed as upgrade transactions and must be
+-- preserved.
+data VersionQuirks = VersionQuirks
+    { _quirkGasFees :: !(HashMap RequestKey Gas)
+      -- ^ Gas fee to charge at particular 'RequestKey's.
+      --   This should be 'MilliGas' once 'applyCmd' is refactored
+      --   to use 'MilliGas' instead of 'Gas'.
+      --   Note: only works for user txs in blocks right now.
+    }
+    deriving stock (Show, Eq, Ord, Generic)
+    deriving anyclass (NFData)
+
+noQuirks :: VersionQuirks
+noQuirks = VersionQuirks
+    { _quirkGasFees = HM.empty
+    }
+
 -- | Chainweb versions are sets of properties that must remain consistent among
 -- all nodes on the same network. For examples see `Chainweb.Version.Mainnet`,
--- `Chainweb.Version.Testnet`, `Chainweb.Version.Development`, and
+-- `Chainweb.Version.Testnet`, `Chainweb.Version.RecapDevelopment`, and
 -- `Chainweb.Test.TestVersions`.
 --
 -- NOTE: none of the fields should be strict at any level, because of how we
@@ -315,15 +374,15 @@ data ChainwebVersion
         -- ^ The textual name of the Version, used in almost all REST endpoints.
     , _versionGraphs :: Rule BlockHeight ChainGraph
         -- ^ The chain graphs in the history and at which block heights they apply.
-    , _versionForks :: HashMap Fork (ChainMap BlockHeight)
+    , _versionForks :: HashMap Fork (ChainMap ForkHeight)
         -- ^ The block heights on each chain to apply behavioral changes.
         -- Interpretation of these is up to the functions in
         -- `Chainweb.Version.Guards`.
     , _versionUpgrades :: ChainMap (HashMap BlockHeight Upgrade)
         -- ^ The upgrade transactions to execute on each chain at certain block
         -- heights.
-    , _versionBlockRate :: BlockRate
-        -- ^ The Proof-of-Work `BlockRate` for each `ChainwebVersion`. This is
+    , _versionBlockDelay :: BlockDelay
+        -- ^ The Proof-of-Work `BlockDelay` for each `ChainwebVersion`. This is
         -- the number of microseconds we expect to pass while a miner mines on
         -- various chains, eventually succeeding on one.
     , _versionWindow :: WindowWidth
@@ -344,6 +403,10 @@ data ChainwebVersion
         -- ^ Whether to disable any core functionality.
     , _versionDefaults :: VersionDefaults
         -- ^ Version-specific defaults that can be overridden elsewhere.
+    , _versionVerifierPluginNames :: ChainMap (Rule BlockHeight (Set VerifierName))
+        -- ^ Verifier plugins that can be run to verify transaction contents.
+    , _versionQuirks :: VersionQuirks
+        -- ^ Modifications to behavior at particular blockheights
     }
     deriving stock (Generic)
     deriving anyclass NFData
@@ -359,7 +422,7 @@ instance Ord ChainwebVersion where
         , _versionForks v `compare` _versionForks v'
         -- upgrades cannot be ordered because Payload in Pact cannot be ordered
         -- , _versionUpgrades v `compare` _versionUpgrades v'
-        , _versionBlockRate v `compare` _versionBlockRate v'
+        , _versionBlockDelay v `compare` _versionBlockDelay v'
         , _versionWindow v `compare` _versionWindow v'
         , _versionHeaderBaseSizeBytes v `compare` _versionHeaderBaseSizeBytes v'
         , _versionMaxBlockGasLimit v `compare` _versionMaxBlockGasLimit v'
@@ -367,6 +430,7 @@ instance Ord ChainwebVersion where
         -- genesis cannot be ordered because Payload in Pact cannot be ordered
         -- , _versionGenesis v `compare` _versionGenesis v'
         , _versionCheats v `compare` _versionCheats v'
+        , _versionVerifierPluginNames v `compare` _versionVerifierPluginNames v'
         ]
 
 instance Eq ChainwebVersion where
@@ -411,6 +475,7 @@ makeLensesWith (lensRules & generateLazyPatterns .~ True) 'ChainwebVersion
 makeLensesWith (lensRules & generateLazyPatterns .~ True) 'VersionGenesis
 makeLensesWith (lensRules & generateLazyPatterns .~ True) 'VersionCheats
 makeLensesWith (lensRules & generateLazyPatterns .~ True) 'VersionDefaults
+makeLensesWith (lensRules & generateLazyPatterns .~ True) 'VersionQuirks
 
 genesisBlockPayloadHash :: ChainwebVersion -> ChainId -> BlockPayloadHash
 genesisBlockPayloadHash v cid = v ^?! versionGenesis . genesisBlockPayload . onChain cid . to _payloadWithOutputsPayloadHash
@@ -525,17 +590,16 @@ instance HasChainGraph (ChainwebVersion, BlockHeight) where
 domainAddr2PeerInfo :: [HostAddress] -> [PeerInfo]
 domainAddr2PeerInfo = fmap (PeerInfo Nothing)
 
--- | Creates a map from fork heights to upgrades.
-forkUpgrades
+-- | A utility to allow indexing behavior by forks, returning that behavior
+-- indexed by the block heights of those forks.
+indexByForkHeights
     :: ChainwebVersion
-    -> [(Fork, ChainMap Upgrade)]
-    -> ChainMap (HashMap BlockHeight Upgrade)
-forkUpgrades v = OnChains . foldl' go (HM.empty <$ HS.toMap (chainIds v))
+    -> [(Fork, ChainMap a)]
+    -> ChainMap (HashMap BlockHeight a)
+indexByForkHeights v = OnChains . foldl' go (HM.empty <$ HS.toMap (chainIds v))
   where
     conflictError fork h =
-        error $ "conflicting upgrades at block height " <> show h <> " when adding upgrade for fork " <> show fork
-    emptyUpgradeError fork =
-        error $ "empty set of upgrade transactions for fork " <> show fork
+        error $ "conflicting behavior at block height " <> show h <> " when adding behavior for fork " <> show fork
     go acc (fork, txsPerChain) =
         HM.unionWith
             (HM.unionWithKey (conflictError fork))
@@ -545,8 +609,7 @@ forkUpgrades v = OnChains . foldl' go (HM.empty <$ HS.toMap (chainIds v))
             [ (cid, HM.singleton forkHeight upg)
             | cid <- HM.keys acc
             , Just upg <- [txsPerChain ^? onChain cid]
-            , not (null $ _upgradeTransactions upg) || emptyUpgradeError fork
-            , let forkHeight = v ^?! versionForks . at fork . _Just . onChain cid
+            , ForkAtBlockHeight forkHeight <- [v ^?! versionForks . at fork . _Just . onChain cid]
             , forkHeight /= maxBound
             ]
 
@@ -556,7 +619,7 @@ latestBehaviorAt :: ChainwebVersion -> BlockHeight
 latestBehaviorAt v = foldlOf' behaviorChanges max 0 v + 1
     where
     behaviorChanges = fold
-        [ versionForks . folded . folded
+        [ versionForks . folded . folded . _ForkAtBlockHeight
         , versionUpgrades . folded . ifolded . asIndex
         , versionGraphs . to ruleHead . _1 . _Just
-        ] . filtered (/= maxBound)
+        ]

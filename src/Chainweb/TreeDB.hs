@@ -43,6 +43,7 @@ module Chainweb.TreeDB
 , root
 , minRank
 , toTree
+, GenesisParent(..)
 
 -- ** Limiting and Seeking a Stream
 , Eos(..)
@@ -61,6 +62,7 @@ module Chainweb.TreeDB
 , lookupM
 , lookupRankedM
 , lookupStreamM
+, lookupParentM
 
 -- * Misc Utils
 , forkEntry
@@ -83,7 +85,7 @@ import Control.Monad
 import Control.Monad.Catch
 import Control.Monad.Trans
 
-import Data.Aeson
+import Data.Aeson hiding (Key)
 import Data.Foldable
 import Data.Function
 import Data.Functor.Of

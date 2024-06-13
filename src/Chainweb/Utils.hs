@@ -10,6 +10,7 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -74,9 +75,14 @@ module Chainweb.Utils
 , alignWithV
 , (&)
 , IxedGet(..)
+, ix'
 , minusOrZero
 , interleaveIO
 , mutableVectorFromList
+, timeoutYield
+, showClientError
+, showHTTPRequestException
+, matchOrDisplayException
 
 -- * Encoding and Serialization
 , EncodingException(..)
@@ -151,6 +157,7 @@ module Chainweb.Utils
 , enableConfigConfig
 , enableConfigEnabled
 , defaultEnableConfig
+, defaultDisableConfig
 , pEnableConfig
 , enabledConfig
 , validateEnableConfig
@@ -264,7 +271,7 @@ import GHC.TypeLits (KnownSymbol, symbolVal)
 import qualified Network.Connection as HTTP
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTP
-import Network.Socket
+import Network.Socket hiding (Debug)
 
 import Numeric.Natural
 
@@ -277,10 +284,12 @@ import System.IO.Unsafe (unsafeInterleaveIO, unsafePerformIO)
 import System.LogLevel
 import qualified System.Random.MWC as Prob
 import qualified System.Random.MWC.Probability as Prob
-import System.Timeout
+import qualified System.Timeout as Timeout
 
 import Text.Printf (printf)
 import Text.Read (readEither)
+import qualified Servant.Client
+import qualified Network.HTTP.Types as HTTP
 
 -- -------------------------------------------------------------------------- --
 -- SI unit prefixes
@@ -421,7 +430,7 @@ mutableVectorFromList as = do
 -- | Provides a simple Fold lets you fold the value at a given key in a Map or
 -- element at an ordinal position in a list or Seq.
 --
--- This is a restrictec version of 'Ixed' from the lens package that prevents
+-- This is a restricted version of 'Ixed' from the lens package that prevents
 -- the value at the key from being modified.
 --
 class IxedGet a where
@@ -433,6 +442,19 @@ class IxedGet a where
     default ixg :: Ixed a => Index a -> Fold a (IxValue a)
     ixg i = ix i
     {-# INLINE ixg #-}
+
+-- | A strict version of 'ix'. It requires a 'Monad' constraint on the context.
+--
+ix'
+    :: forall s f
+    . Monad f
+    => Ixed s
+    => Index s
+    -> (IxValue s -> f (IxValue s))
+    -> s
+    -> f s
+ix' i f = ix i (f >=> \ !r -> return r)
+{-# INLINE ix' #-}
 
 -- -------------------------------------------------------------------------- --
 -- * Encodings and Serialization
@@ -503,6 +525,18 @@ instance HasTextRepresentation Int where
     {-# INLINE fromText #-}
 
 instance HasTextRepresentation Integer where
+    toText = sshow
+    {-# INLINE toText #-}
+    fromText = treadM
+    {-# INLINE fromText #-}
+
+instance HasTextRepresentation Word where
+    toText = sshow
+    {-# INLINE toText #-}
+    fromText = treadM
+    {-# INLINE fromText #-}
+
+instance HasTextRepresentation Word64 where
     toText = sshow
     {-# INLINE toText #-}
     fromText = treadM
@@ -900,7 +934,7 @@ tryAllSynchronous = trySynchronous
 --
 runForever :: (LogLevel -> T.Text -> IO ()) -> T.Text -> IO () -> IO ()
 runForever logfun name a = mask $ \umask -> do
-    logfun Info $ "start " <> name
+    logfun Debug $ "start " <> name
     let go = do
             forever (umask a) `catchAllSynchronous` \e ->
                 logfun Error $ name <> " failed: " <> sshow e <> ". Restarting ..."
@@ -927,7 +961,7 @@ runForeverThrottled
     -> IO ()
 runForeverThrottled logfun name burst rate a = mask $ \umask -> do
     tokenBucket <- newTokenBucket
-    logfun Info $ "start " <> name
+    logfun Debug $ "start " <> name
     let runThrottled = tokenBucketWait tokenBucket burst rate >> a
         go = do
             forever (umask runThrottled) `catchAllSynchronous` \e ->
@@ -958,7 +992,15 @@ defaultEnableConfig a = EnableConfig
     , _enableConfigConfig = a
     }
 
-enableConfigProperties :: ToJSON a => KeyValue kv => EnableConfig a -> [kv]
+-- | The default is that the configured component is disabled.
+--
+defaultDisableConfig :: a -> EnableConfig a
+defaultDisableConfig a = EnableConfig
+    { _enableConfigEnabled = False
+    , _enableConfigConfig = a
+    }
+
+enableConfigProperties :: ToJSON a => KeyValue e kv => EnableConfig a -> [kv]
 enableConfigProperties o =
     [ "enabled" .= _enableConfigEnabled o
     , "configuration" .= _enableConfigConfig o
@@ -1021,7 +1063,7 @@ timeoutStream
     -> S.Stream (Of a) IO (Maybe r)
 timeoutStream msecs = go
   where
-    go s = lift (timeout msecs (S.next s)) >>= \case
+    go s = lift (Timeout.timeout msecs (S.next s)) >>= \case
         Nothing -> return Nothing
         Just (Left r) -> return (Just r)
         Just (Right (a, s')) -> S.yield a >> go s'
@@ -1214,9 +1256,20 @@ thd (_,_,c) = c
 data T2 a b = T2 !a !b
     deriving (Show, Eq, Ord, Generic, NFData, Functor)
 
+instance (Semigroup a, Semigroup b) => Semigroup (T2 a b) where
+    T2 a b <> T2 a' b' = T2 (a <> a') (b <> b')
+
+instance (Monoid a, Monoid b) => Monoid (T2 a b) where
+    mappend = (<>)
+    mempty = T2 mempty mempty
+
 instance Bifunctor T2 where
     bimap f g (T2 a b) =  T2 (f a) (g b)
     {-# INLINE bimap #-}
+instance Field1 (T2 a b) (T2 x b) a x where
+    _1 = lens (\(T2 a _b) -> a) (\(T2 _a b) x -> T2 x b)
+instance Field2 (T2 a b) (T2 a x) b x where
+    _2 = lens (\(T2 _a b) -> b) (\(T2 a _b) x -> T2 a x)
 
 data T3 a b c = T3 !a !b !c
     deriving (Show, Eq, Ord, Generic, NFData, Functor)
@@ -1224,6 +1277,12 @@ data T3 a b c = T3 !a !b !c
 instance Bifunctor (T3 a) where
     bimap f g (T3 a b c) =  T3 a (f b) (g c)
     {-# INLINE bimap #-}
+instance Field1 (T3 a b c) (T3 x b c) a x where
+    _1 = lens (\(T3 a _b _c) -> a) (\(T3 _a b c) x -> T3 x b c)
+instance Field2 (T3 a b c) (T3 a x c) b x where
+    _2 = lens (\(T3 _a b _c) -> b) (\(T3 a _b c) x -> T3 a x c)
+instance Field3 (T3 a b c) (T3 a b x) c x where
+    _3 = lens (\(T3 _a _b c) -> c) (\(T3 a b _c) x -> T3 a b x)
 
 sfst :: T2 a b -> a
 sfst (T2 a _) = a
@@ -1299,20 +1358,12 @@ unsafeManagerWithSettings settings = HTTP.newTlsManagerWith
 setManagerRequestTimeout :: Int -> HTTP.ManagerSettings -> HTTP.ManagerSettings
 setManagerRequestTimeout micros settings = settings
     { HTTP.managerResponseTimeout = HTTP.responseTimeoutMicro micros
-        -- timeout connection-attempts after 10 sec instead of the default of 30 sec
-    , HTTP.managerModifyRequest = \req -> do
-        HTTP.managerModifyRequest settings req
-            { HTTP.responseTimeout = HTTP.responseTimeoutMicro micros
-                -- overwrite the explicit connection timeout from servant-client
-                -- (If the request has a timeout configured, the global timeout of
-                -- the manager is ignored)
-            }
     }
 
 -- -------------------------------------------------------------------------- --
 -- SockAddr from network package
 
-sockAddrJson :: KeyValue kv => SockAddr -> [kv]
+sockAddrJson :: KeyValue e kv => SockAddr -> [kv]
 sockAddrJson (SockAddrInet p i) =
     [ "ipv4" .= showIpv4 i
     , "port" .= fromIntegral @PortNumber @Int p
@@ -1365,3 +1416,40 @@ parseUtcTime d = case parseTimeM False defaultTimeLocale fmt d of
     Just x -> return x
   where
     fmt = iso8601DateTimeFormat
+
+-- | Timeout.timeout with a `threadDelay` after the action to more consistently
+-- trigger the timeout.
+timeoutYield :: Int -> IO a -> IO (Maybe a)
+timeoutYield time act =
+    Timeout.timeout time (act <* threadDelay 1)
+
+showClientError :: Servant.Client.ClientError -> T.Text
+showClientError (Servant.Client.FailureResponse _ resp) =
+    "Error code " <> sshow (HTTP.statusCode $ Servant.Client.responseStatusCode resp)
+showClientError (Servant.Client.ConnectionError anyException) =
+    matchOrDisplayException @HTTP.HttpException showHTTPRequestException anyException
+showClientError e =
+    T.pack $ displayException e
+
+showHTTPRequestException :: HTTP.HttpException -> T.Text
+showHTTPRequestException (HTTP.HttpExceptionRequest _request content)
+    = case content of
+        HTTP.StatusCodeException resp _ ->
+            "Error status code: " <>
+            sshow (HTTP.statusCode $ HTTP.responseStatus resp)
+        HTTP.TooManyRedirects _ -> "Too many redirects"
+        HTTP.InternalException e
+            | Just (HTTP.HostCannotConnect _ es) <- fromException e
+                -> "Host cannot connect: " <> sshow es
+            | otherwise
+                -> sshow e
+        _ -> sshow content
+showHTTPRequestException ex
+    = T.pack $ displayException ex
+
+matchOrDisplayException :: Exception e => (e -> T.Text) -> SomeException -> T.Text
+matchOrDisplayException display anyException
+    | Just specificException <- fromException anyException
+    = display specificException
+    | otherwise
+    = T.pack $ displayException anyException

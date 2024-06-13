@@ -51,6 +51,7 @@ module Chainweb.Cut.CutHashes
 , cutHashesHeight
 , cutHashesHeaders
 , cutHashesPayloads
+, cutHashesLocalPayload
 , cutToCutHashes
 , CutHashesCas
 , _cutHashesMaxHeight
@@ -84,8 +85,6 @@ import Foreign.Storable
 
 import GHC.Generics (Generic)
 import GHC.TypeNats
-
-import Numeric.Natural
 
 import System.IO.Unsafe
 
@@ -233,7 +232,7 @@ data BlockHashWithHeight = BlockHashWithHeight
     deriving (Show, Eq, Ord, Generic)
     deriving anyclass (NFData)
 
-blockHashWithHeightProperties :: KeyValue kv => BlockHashWithHeight -> [kv]
+blockHashWithHeightProperties :: KeyValue e kv => BlockHashWithHeight -> [kv]
 blockHashWithHeightProperties o =
     [ "height" .= _bhwhHeight o
     , "hash" .= _bhwhHash o
@@ -273,6 +272,9 @@ data CutHashes = CutHashes
         -- ^ optional block headers
     , _cutHashesPayloads :: !(HM.HashMap BlockPayloadHash PayloadData)
         -- ^ optional block payloads
+    , _cutHashesLocalPayload :: !(Maybe (BlockPayloadHash, PayloadWithOutputs))
+        -- ^ optional, and unused except for error reporting, outputs
+        -- Note: we cannot trust outputs from other nodes!
     }
     deriving (Show, Generic)
     deriving anyclass (NFData)
@@ -313,7 +315,7 @@ instance Ord CutHashes where
     compare = compare `on` (_cutHashesWeight &&& _cutHashesId)
     {-# INLINE compare #-}
 
-cutHashesProperties :: forall kv . KeyValue kv => CutHashes -> [kv]
+cutHashesProperties :: forall e kv . KeyValue e kv => CutHashes -> [kv]
 cutHashesProperties c =
     [ "hashes" .= _cutHashes c
     , "origin" .= _cutOrigin c
@@ -328,7 +330,7 @@ cutHashesProperties c =
     ifNotEmpty
         :: ToJSONKey k
         => ToJSON v
-        => T.Text
+        => Key
         -> Lens' CutHashes (HM.HashMap k v)
         -> [kv]
     ifNotEmpty s l
@@ -351,6 +353,7 @@ instance FromJSON CutHashes where
         <*> o .: "id"
         <*> o .:? "headers" .!= mempty
         <*> o .:? "payloads" .!= mempty
+        <*> pure Nothing
 
 -- | Compute a 'CutHashes' structure from a 'Cut'. The result doesn't include
 -- any block headers or payloads.
@@ -365,6 +368,7 @@ cutToCutHashes p c = CutHashes
     , _cutHashesId = _cutId c
     , _cutHashesHeaders = mempty
     , _cutHashesPayloads = mempty
+    , _cutHashesLocalPayload = Nothing
     }
 
 instance HasCutId CutHashes where

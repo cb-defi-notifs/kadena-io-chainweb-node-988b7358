@@ -3,6 +3,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE TypeApplications #-}
 
 -- |
 -- Module: Chainweb.Rosetta.Internal
@@ -15,12 +16,12 @@
 module Chainweb.Rosetta.Internal where
 
 import Control.Error.Util
+import Control.Exception.Safe (try)
 import Control.Lens hiding ((??), from, to)
 import Control.Monad (foldM)
 import Control.Monad.Except (throwError)
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Except
-import Data.Aeson (Value)
 import Data.Map (Map)
 import Data.List (foldl', find)
 import Data.Default (def)
@@ -35,15 +36,16 @@ import qualified Data.Text as T
 import qualified Data.Vector as V
 import qualified Data.Set as S
 
-import qualified Pact.Types.Runtime as P
 import qualified Pact.Parse as P
 import qualified Pact.Types.Capability as P
 import qualified Pact.Types.Command as P
+import qualified Pact.Types.Runtime as P
 
 import Pact.Types.Command
 import Pact.Types.Hash
 import Pact.Types.Runtime (TxId(..), Domain(..), TxLog(..))
 import Pact.Types.Persistence (RowKey(..))
+import Pact.Types.RowData (RowData)
 import Pact.Types.PactValue
 
 import Rosetta
@@ -56,7 +58,7 @@ import Chainweb.BlockHeader
 import Chainweb.ChainId
 import Chainweb.Cut
 import Chainweb.CutDB
-import Chainweb.Pact.Service.Types (Domain'(..), BlockTxHistory(..))
+import Chainweb.Pact.Service.Types (BlockTxHistory(..), PactException(..))
 import Chainweb.Payload hiding (Transaction(..))
 import Chainweb.Payload.PayloadStore
 import Chainweb.Rosetta.Utils
@@ -186,7 +188,6 @@ genesisTransactions
 genesisTransactions logs cid txs =
   pure $ V.toList $ V.map (getGenesisLog logs cid) txs
 
-
 -- | Matches a single genesis transaction to its coin contract logs.
 genesisTransaction
     :: Map TxId [AccountLog]
@@ -199,7 +200,6 @@ genesisTransaction logs cid rest target = do
   cr <- note RosettaTxIdNotFound $
         V.find (\c -> _crReqKey c == target) rest
   pure $ getGenesisLog logs cid cr
-
 
 ------------------------
 -- Coinbase Helpers --
@@ -510,7 +510,6 @@ getLatestBlockHeader cutDb cid = do
   c <- liftIO $ _cut cutDb
   HM.lookup cid (_cutMap c) ?? RosettaInvalidChain
 
-
 findBlockHeaderInCurrFork
     :: CutDb tbl
     -> ChainId
@@ -545,7 +544,6 @@ findBlockHeaderInCurrFork cutDb cid someHeight someHash = do
       somebh <- liftIO $ seekAncestor db latest (int hi)
       somebh ?? RosettaInvalidBlockHeight
 
-
 getBlockOutputs
     :: forall tbl
     . CanReadablePayloadCas tbl
@@ -553,7 +551,7 @@ getBlockOutputs
     -> BlockHeader
     -> ExceptT RosettaFailure Handler (CoinbaseTx (CommandResult Hash), V.Vector (CommandResult Hash))
 getBlockOutputs payloadDb bh = do
-  someOut <- liftIO $ tableLookup payloadDb (_blockPayloadHash bh)
+  someOut <- liftIO $ lookupPayloadWithHeight payloadDb (Just $ _blockHeight bh) (_blockPayloadHash bh)
   outputs <- someOut ?? RosettaPayloadNotFound
   txsOut <- decodeTxsOut outputs ?? RosettaUnparsableTxOut
   coinbaseOut <- decodeCoinbaseOut outputs ?? RosettaUnparsableTxOut
@@ -572,16 +570,16 @@ getTxLogs
     -> BlockHeader
     -> ExceptT RosettaFailure Handler (Map TxId [AccountLog])
 getTxLogs cr bh = do
-  someHist <- liftIO $ _pactBlockTxHistory cr bh d
+  someHist <- liftIO $ try @_ @PactException $ _pactBlockTxHistory cr bh d
   (BlockTxHistory hist prevTxs) <- hush someHist ?? RosettaPactExceptionThrown
   lastBalSeen <- hoistEither $ parsePrevTxs prevTxs
   histAcctRow <- hoistEither $ parseHist hist
   pure $ getBalanceDeltas histAcctRow lastBalSeen
   where
-    d = Domain' (UserTables "coin_coin-table")
+    d = UserTables "coin_coin-table"
 
     parseHist
-        :: Map TxId [TxLog Value]
+        :: Map TxId [TxLog RowData]
         -> Either RosettaFailure (Map TxId [AccountRow])
     parseHist m
       | M.size parsed == M.size m = pure $! parsed
@@ -590,7 +588,7 @@ getTxLogs cr bh = do
         parsed = M.mapMaybe (mapM txLogToAccountRow) m
 
     parsePrevTxs
-        :: Map RowKey (TxLog Value)
+        :: Map RowKey (TxLog RowData)
         -> Either RosettaFailure (Map RowKey AccountRow)
     parsePrevTxs m
       | M.size parsed == M.size m = pure $! parsed
@@ -651,7 +649,7 @@ getHistoricalLookupBalance'
     -> T.Text
     -> ExceptT RosettaFailure Handler (Maybe AccountRow)
 getHistoricalLookupBalance' cr bh k = do
-  someHist <- liftIO $ _pactHistoricalLookup cr bh d key
+  someHist <- liftIO $ try @_ @PactException $ _pactHistoricalLookup cr bh d key
   hist <- hush someHist ?? RosettaPactExceptionThrown
   case hist of
     Nothing -> pure Nothing
@@ -659,7 +657,7 @@ getHistoricalLookupBalance' cr bh k = do
       row <- txLogToAccountRow h ?? RosettaUnparsableTxLog
       pure $ Just row
   where
-    d = Domain' (UserTables "coin_coin-table")
+    d = UserTables "coin_coin-table"
     key = RowKey k -- TODO: How to sanitize this further
 
 getHistoricalLookupBalance
@@ -840,7 +838,7 @@ rosettaPubKeysToSignerMap pubKeys = HM.fromList <$> mapM f pubKeys
   where
     f (RosettaPublicKey pk ct) = do
       sk <- getScheme ct
-      addr <- toPactPubKeyAddr pk sk
+      addr <- toPactPubKeyAddr pk
       let signerWithoutCap = P.Signer (Just sk) pk (Just addr)
       pure (addr, signerWithoutCap)
 

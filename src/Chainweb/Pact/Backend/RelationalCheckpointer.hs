@@ -1,8 +1,11 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE ViewPatterns #-}
 
 -- |
 -- Module: Chainweb.Pact.Backend.RelationalCheckpointer
@@ -21,31 +24,28 @@ module Chainweb.Pact.Backend.RelationalCheckpointer
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async
 import Control.Concurrent.MVar
-import Control.Lens
 import Control.Monad
 import Control.Monad.Catch
 import Control.Monad.IO.Class
-import Control.Monad.State (gets)
 
-import Data.ByteString (ByteString)
+import Data.ByteString (intercalate)
 import qualified Data.ByteString.Short as BS
-import Data.Aeson hiding (encode,(.=))
-import qualified Data.DList as DL
-import Data.Foldable (toList,foldl')
+import Data.Foldable (foldl')
 import Data.Int
 import qualified Data.Map.Strict as M
 import Data.Maybe
 import qualified Data.HashMap.Strict as HashMap
-import qualified Data.List as List
 import qualified Data.Set as S
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import qualified Data.Vector as V
-import qualified Data.Vector.Algorithms.Tim as TimSort
+import GHC.Stack (HasCallStack)
 
 import Database.SQLite3.Direct
 
 import Prelude hiding (log)
+import Streaming
+import qualified Streaming.Prelude as Streaming
 
 import System.LogLevel
 
@@ -53,188 +53,234 @@ import System.LogLevel
 
 import Pact.Interpreter (PactDbEnv(..))
 import Pact.Types.Hash (PactHash, TypedHash(..))
-import Pact.Types.Logger (Logger(..))
 import Pact.Types.Persistence
+import Pact.Types.RowData
 import Pact.Types.SQLite
 
 -- chainweb
 import Chainweb.BlockHash
 import Chainweb.BlockHeader
 import Chainweb.BlockHeight
-import qualified Chainweb.Logger as C
+import Chainweb.Logger
 import Chainweb.Pact.Backend.ChainwebPactDb
 import Chainweb.Pact.Backend.Types
 import Chainweb.Pact.Backend.Utils
-import Chainweb.Pact.Backend.DbCache (updateCacheStats)
+import Chainweb.Pact.Backend.DbCache
 import Chainweb.Pact.Service.Types
+import Chainweb.Pact.Types (defaultModuleCacheLimit)
 import Chainweb.Utils
 import Chainweb.Utils.Serialization
 import Chainweb.Version
-import Chainweb.Version.Guards
 
 initRelationalCheckpointer
-    :: BlockState
+    :: (Logger logger)
+    => DbCacheLimitBytes
     -> SQLiteEnv
-    -> Logger
+    -> IntraBlockPersistence
+    -> logger
     -> ChainwebVersion
     -> ChainId
-    -> IO CheckpointEnv
-initRelationalCheckpointer bstate sqlenv loggr v cid =
-    snd <$!> initRelationalCheckpointer' bstate sqlenv loggr v cid
+    -> IO (Checkpointer logger)
+initRelationalCheckpointer dbCacheLimit sqlenv p loggr v cid =
+    snd <$!> initRelationalCheckpointer' dbCacheLimit sqlenv p loggr v cid
 
 withProdRelationalCheckpointer
-    :: C.Logger logger
+    :: (Logger logger)
     => logger
-    -> BlockState
+    -> DbCacheLimitBytes
     -> SQLiteEnv
-    -> Logger
+    -> IntraBlockPersistence
     -> ChainwebVersion
     -> ChainId
-    -> (CheckpointEnv -> IO a)
+    -> (Checkpointer logger -> IO a)
     -> IO a
-withProdRelationalCheckpointer logger bstate sqlenv pactLogger v cid inner = do
-    (dbenv, cpenv) <- initRelationalCheckpointer' bstate sqlenv pactLogger v cid
-    withAsync (logModuleCacheStats dbenv) $ \_ -> inner cpenv
+withProdRelationalCheckpointer logger dbCacheLimit sqlenv p v cid inner = do
+    (moduleCacheVar, cp) <- initRelationalCheckpointer' dbCacheLimit sqlenv p logger v cid
+    withAsync (logModuleCacheStats moduleCacheVar) $ \_ -> inner cp
   where
-    logFun = C.logFunctionText logger
+    logFun = logFunctionText logger
     logModuleCacheStats e = runForever logFun "ModuleCacheStats" $ do
-        stats <- modifyMVar (pdPactDbVar e) $ \db -> do
-            let (s, !mc') = updateCacheStats $ _bsModuleCache $ _benvBlockState db
-                !db' = set (benvBlockState . bsModuleCache) mc' db
-            return (db', s)
-        C.logFunctionJson logger Info stats
-        threadDelay (60 * 1000000)
+        stats <- modifyMVar e $ \db -> do
+            let (s, !mc') = updateCacheStats db
+            return (mc', s)
+        logFunctionJson logger Info stats
+        threadDelay 60_000_000 {- 1 minute -}
 
 -- for testing
 initRelationalCheckpointer'
-    :: BlockState
+    :: (Logger logger)
+    => DbCacheLimitBytes
     -> SQLiteEnv
-    -> Logger
+    -> IntraBlockPersistence
+    -> logger
     -> ChainwebVersion
     -> ChainId
-    -> IO (PactDbEnv (BlockEnv SQLiteEnv), CheckpointEnv)
-initRelationalCheckpointer' bstate sqlenv loggr v cid = do
-    let dbenv = BlockDbEnv sqlenv loggr
-    db <- newMVar (BlockEnv dbenv bstate)
-    runBlockEnv db initSchema
-    return
-      (PactDbEnv chainwebPactDb db,
-       CheckpointEnv
-        { _cpeCheckpointer =
-            Checkpointer
-            {
-                _cpRestore = doRestore v cid db
-              , _cpSave = doSave db
-              , _cpDiscard = doDiscard db
-              , _cpGetLatestBlock = doGetLatest db
-              , _cpBeginCheckpointerBatch = doBeginBatch db
-              , _cpCommitCheckpointerBatch = doCommitBatch db
-              , _cpDiscardCheckpointerBatch = doDiscardBatch db
-              , _cpLookupBlockInCheckpointer = doLookupBlock db
-              , _cpGetBlockParent = doGetBlockParent v cid db
-              , _cpRegisterProcessedTx = doRegisterSuccessful db
-              , _cpLookupProcessedTx = doLookupSuccessful db
-              , _cpGetBlockHistory = doGetBlockHistory db
-              , _cpGetHistoricalLookup = doGetHistoricalLookup db
+    -> IO (MVar (DbCache PersistModuleData), Checkpointer logger)
+initRelationalCheckpointer' dbCacheLimit sqlenv p loggr v cid = do
+    initSchema loggr sqlenv
+    moduleCacheVar <- newMVar (emptyDbCache dbCacheLimit)
+    let
+        checkpointer = Checkpointer
+            { _cpRestoreAndSave = doRestoreAndSave loggr v cid sqlenv p moduleCacheVar
+            , _cpReadCp = ReadCheckpointer
+                { _cpReadFrom = doReadFrom loggr v cid sqlenv moduleCacheVar
+                , _cpGetBlockHistory = doGetBlockHistory sqlenv
+                , _cpGetHistoricalLookup = doGetHistoricalLookup sqlenv
+                , _cpGetEarliestBlock = doGetEarliestBlock sqlenv
+                , _cpGetLatestBlock = doGetLatestBlock sqlenv
+                , _cpLookupBlockInCheckpointer = doLookupBlock sqlenv
+                , _cpGetBlockParent = doGetBlockParent v cid sqlenv
+                , _cpLogger = loggr
+                }
+            }
+    return (moduleCacheVar, checkpointer)
+
+
+-- see the docs for _cpReadFrom
+doReadFrom
+  :: (Logger logger)
+  => logger
+  -> ChainwebVersion
+  -> ChainId
+  -> SQLiteEnv
+  -> MVar (DbCache PersistModuleData)
+  -> Maybe ParentHeader
+  -> (CurrentBlockDbEnv logger -> IO a)
+  -> IO a
+doReadFrom logger v cid sql moduleCacheVar parent doRead = do
+  let currentHeight = maybe (genesisHeight v cid) (succ . _blockHeight . _parentHeader) parent
+
+  withMVar moduleCacheVar $ \sharedModuleCache -> do
+    bracket
+      (beginSavepoint sql BatchSavepoint)
+      (\_ -> abortSavepoint sql BatchSavepoint) $ \() -> do
+      txid <- getEndTxId "doReadFrom" sql parent
+      newDbEnv <- newMVar $ BlockEnv
+        (mkBlockHandlerEnv v cid currentHeight sql DoNotPersistIntraBlockWrites logger)
+        (initBlockState defaultModuleCacheLimit txid)
+          { _bsModuleCache = sharedModuleCache }
+      -- NB it's important to do this *after* you start the savepoint (and thus
+      -- the db transaction) to make sure that the latestHeader check is up to date.
+      latestHeader <- doGetLatestBlock sql
+      let
+        -- is the parent the latest header, i.e., can we get away without rewinding?
+        parentIsLatestHeader = case (latestHeader, parent) of
+          (Nothing, Nothing) -> True
+          (Just (_, latestHash), Just (ParentHeader ph)) ->
+            _blockHash ph == latestHash
+          _ -> False
+
+      let
+        pactDb
+          | parentIsLatestHeader = chainwebPactDb
+          | otherwise = rewoundPactDb currentHeight txid
+        curBlockDbEnv = CurrentBlockDbEnv
+          { _cpPactDbEnv = PactDbEnv pactDb newDbEnv
+          , _cpRegisterProcessedTx =
+            \(TypedHash hash) -> runBlockEnv newDbEnv (indexPactTransaction $ BS.fromShort hash)
+          , _cpLookupProcessedTx = \hs ->
+            runBlockEnv newDbEnv (doLookupSuccessful currentHeight hs)
+          }
+      doRead curBlockDbEnv
+
+
+-- TODO: log more?
+-- see the docs for _cpRestoreAndSave.
+doRestoreAndSave
+  :: forall logger r q.
+  (Logger logger, Monoid q, HasCallStack)
+  => logger
+  -> ChainwebVersion
+  -> ChainId
+  -> SQLiteEnv
+  -> IntraBlockPersistence
+  -> MVar (DbCache PersistModuleData)
+  -> Maybe ParentHeader
+  -> Stream (Of (RunnableBlock logger q)) IO r
+  -> IO (r, q)
+doRestoreAndSave logger v cid sql p moduleCacheVar parent blocks =
+    modifyMVar moduleCacheVar $ \moduleCache -> do
+      fmap fst $ generalBracket
+        (beginSavepoint sql BatchSavepoint)
+        (\_ -> \case
+          ExitCaseSuccess {} -> commitSavepoint sql BatchSavepoint
+          _ -> abortSavepoint sql BatchSavepoint
+        ) $ \_ -> do
+          rewindDbTo sql parent
+          txid <- getEndTxId "restoreAndSave" sql parent
+          ((q, _, _, finalModuleCache) :> r) <- extend txid moduleCache
+          return (finalModuleCache, (r, q))
+  where
+
+    extend
+      :: TxId -> DbCache PersistModuleData
+      -> IO (Of (q, Maybe ParentHeader, TxId, DbCache PersistModuleData) r)
+    extend startTxId startModuleCache = Streaming.foldM
+      (\(m, pc, txid, moduleCache) block -> do
+        let
+          !bh = maybe (genesisHeight v cid) (succ . _blockHeight . _parentHeader) pc
+        -- prepare the block state
+        let handlerEnv = mkBlockHandlerEnv v cid bh sql p logger
+        let state = (initBlockState defaultModuleCacheLimit txid) { _bsModuleCache = moduleCache }
+        dbMVar <- newMVar BlockEnv
+          { _blockHandlerEnv = handlerEnv
+          , _benvBlockState = state
+          }
+
+        let curBlockDbEnv = CurrentBlockDbEnv
+              { _cpPactDbEnv = PactDbEnv chainwebPactDb dbMVar
+              , _cpRegisterProcessedTx =
+                \(TypedHash hash) -> runBlockEnv dbMVar (indexPactTransaction $ BS.fromShort hash)
+              , _cpLookupProcessedTx = \hs -> runBlockEnv dbMVar $ doLookupSuccessful bh hs
               }
-        , _cpeLogger = loggr
-        })
+        -- execute the block
+        (m', newBh) <- runBlock block curBlockDbEnv pc
+        -- grab any resulting state that we're interested in keeping
+        nextState <- _benvBlockState <$> takeMVar dbMVar
+        let !nextTxId = _bsTxId nextState
+        let !nextModuleCache = _bsModuleCache nextState
+        -- compute the accumulator early
+        let !m'' = m <> m'
+        -- check that the new parent header has the right height for a child
+        -- of the previous block
+        case pc of
+          Nothing
+            | genesisHeight v cid /= _blockHeight newBh -> throwM $ PactInternalError
+              "doRestoreAndSave: block with no parent, genesis block, should have genesis height but doesn't,"
+          Just (ParentHeader ph)
+            | succ (_blockHeight ph) /= _blockHeight newBh -> throwM $ PactInternalError $
+              "doRestoreAndSave: non-genesis block should be one higher than its parent. parent at "
+                <> sshow (_blockHeight ph) <> ", child height " <> sshow (_blockHeight newBh)
+          _ -> return ()
+        -- persist any changes to the database
+        commitBlockStateToDatabase sql (_blockHash newBh) (_blockHeight newBh) nextState
+        return (m'', Just (ParentHeader newBh), nextTxId, nextModuleCache)
+      )
+      (return (mempty, parent, startTxId, startModuleCache))
+      return
+      blocks
 
-type Db = MVar (BlockEnv SQLiteEnv)
-
-doRestore :: ChainwebVersion -> ChainId -> Db -> Maybe (BlockHeight, ParentHash) -> IO PactDbEnv'
-doRestore v cid dbenv (Just (bh, hash)) = runBlockEnv dbenv $ do
-    setModuleNameFix
-    setSortedKeys
-    setLowerCaseTables
-    clearPendingTxState
-    void $ withSavepoint PreBlock $ handlePossibleRewind v cid bh hash
-    beginSavepoint Block
-    return $! PactDbEnv' $! PactDbEnv chainwebPactDb dbenv
+doGetEarliestBlock :: HasCallStack => SQLiteEnv -> IO (Maybe (BlockHeight, BlockHash))
+doGetEarliestBlock db = do
+  r <- qry_ db qtext [RInt, RBlob] >>= mapM go
+  case r of
+    [] -> return Nothing
+    (!o:_) -> return (Just o)
   where
-    -- Module name fix follows the restore call to checkpointer.
-    setModuleNameFix = bsModuleNameFix .= enableModuleNameFix v cid bh
-    setSortedKeys = bsSortedKeys .= pact420 v cid bh
-    setLowerCaseTables = bsLowerCaseTables .= chainweb217Pact v cid bh
-doRestore _ _ dbenv Nothing = runBlockEnv dbenv $ do
-    clearPendingTxState
-    withSavepoint DbTransaction $
-      callDb "doRestoreInitial: resetting tables" $ \db -> do
-        exec_ db "DELETE FROM BlockHistory;"
-        exec_ db "DELETE FROM [SYS:KeySets];"
-        exec_ db "DELETE FROM [SYS:Modules];"
-        exec_ db "DELETE FROM [SYS:Namespaces];"
-        exec_ db "DELETE FROM [SYS:Pacts];"
-        tblNames <- qry_ db "SELECT tablename FROM VersionedTableCreation;" [RText]
-        forM_ tblNames $ \tbl -> case tbl of
-            [SText t] -> exec_ db ("DROP TABLE [" <> t <> "];")
-            _ -> internalError "Something went wrong when resetting tables."
-        exec_ db "DELETE FROM VersionedTableCreation;"
-        exec_ db "DELETE FROM VersionedTableMutation;"
-        exec_ db "DELETE FROM TransactionIndex;"
-    beginSavepoint Block
-    assign bsTxId 0
-    return $! PactDbEnv' $ PactDbEnv chainwebPactDb dbenv
+    qtext = "SELECT blockheight, hash FROM BlockHistory \
+            \ ORDER BY blockheight ASC LIMIT 1"
 
-doSave :: Db -> BlockHash -> IO ()
-doSave dbenv hash = runBlockEnv dbenv $ do
-    height <- gets _bsBlockHeight
-    runPending height
-    nextTxId <- gets _bsTxId
-    blockHistoryInsert height hash nextTxId
+    go [SInt hgt, SBlob blob] =
+        let hash = either error id $ runGetEitherS decodeBlockHash blob
+        in return (fromIntegral hgt, hash)
+    go _ = fail "Chainweb.Pact.Backend.RelationalCheckpointer.doGetEarliest: impossible. This is a bug in chainweb-node."
 
-    -- FIXME: if any of the above fails with an exception the following isn't
-    -- executed and a pending SAVEPOINT is left on the stack.
-    commitSavepoint Block
-    clearPendingTxState
-  where
-    runPending :: BlockHeight -> BlockHandler SQLiteEnv ()
-    runPending bh = do
-        newTables <- use $ bsPendingBlock . pendingTableCreation
-        writes <- use $ bsPendingBlock . pendingWrites
-        createNewTables bh $ toList newTables
-        writeV <- toVectorChunks writes
-        callDb "save" $ backendWriteUpdateBatch bh writeV
-        indexPendingPactTransactions
-
-    prepChunk [] = error "impossible: empty chunk from groupBy"
-    prepChunk chunk@(h:_) = (Utf8 $ _deltaTableName h, V.fromList chunk)
-
-    toVectorChunks writes = liftIO $ do
-        mv <- mutableVectorFromList . DL.toList . DL.concat $
-              HashMap.elems writes
-        TimSort.sort mv
-        l' <- V.toList <$> V.unsafeFreeze mv
-        let ll = List.groupBy (\a b -> _deltaTableName a == _deltaTableName b) l'
-        return $ map prepChunk ll
-
-    createNewTables
-        :: BlockHeight
-        -> [ByteString]
-        -> BlockHandler SQLiteEnv ()
-    createNewTables bh = mapM_ (\tn -> createUserTable (Utf8 tn) bh)
-
--- | Discards all transactions since the most recent @Block@ savepoint and
--- removes the savepoint from the transaction stack.
---
-doDiscard :: Db -> IO ()
-doDiscard dbenv = runBlockEnv dbenv $ do
-    clearPendingTxState
-    rollbackSavepoint Block
-
-    -- @ROLLBACK TO n@ only rolls back updates up to @n@ but doesn't remove the
-    -- savepoint. In order to also pop the savepoint from the stack we commit it
-    -- (as empty transaction). <https://www.sqlite.org/lang_savepoint.html>
-    --
-    commitSavepoint Block
-
-doGetLatest :: Db -> IO (Maybe (BlockHeight, BlockHash))
-doGetLatest dbenv =
-    runBlockEnv dbenv $ callDb "getLatestBlock" $ \db -> do
-        r <- qry_ db qtext [RInt, RBlob] >>= mapM go
-        case r of
-          [] -> return Nothing
-          (!o:_) -> return (Just o)
+doGetLatestBlock :: HasCallStack => SQLiteEnv -> IO (Maybe (BlockHeight, BlockHash))
+doGetLatestBlock db = do
+  r <- qry_ db qtext [RInt, RBlob] >>= mapM go
+  case r of
+    [] -> return Nothing
+    (!o:_) -> return (Just o)
   where
     qtext = "SELECT blockheight, hash FROM BlockHistory \
             \ ORDER BY blockheight DESC LIMIT 1"
@@ -242,104 +288,100 @@ doGetLatest dbenv =
     go [SInt hgt, SBlob blob] =
         let hash = either error id $ runGetEitherS decodeBlockHash blob
         in return (fromIntegral hgt, hash)
-    go _ = fail "impossible"
+    go _ = fail "Chainweb.Pact.Backend.RelationalCheckpointer.doGetLatest: impossible. This is a bug in chainweb-node."
 
-doBeginBatch :: Db -> IO ()
-doBeginBatch db = runBlockEnv db $ beginSavepoint BatchSavepoint
-
-doCommitBatch :: Db -> IO ()
-doCommitBatch db = runBlockEnv db $ commitSavepoint BatchSavepoint
-
--- | Discards all transactions since the most recent @BatchSavepoint@ savepoint
--- and removes the savepoint from the transaction stack.
---
-doDiscardBatch :: Db -> IO ()
-doDiscardBatch db = runBlockEnv db $ do
-    rollbackSavepoint BatchSavepoint
-
-    -- @ROLLBACK TO n@ only rolls back updates up to @n@ but doesn't remove the
-    -- savepoint. In order to also pop the savepoint from the stack we commit it
-    -- (as empty transaction). <https://www.sqlite.org/lang_savepoint.html>
-    --
-    commitSavepoint BatchSavepoint
-
-doLookupBlock :: Db -> (BlockHeight, BlockHash) -> IO Bool
-doLookupBlock dbenv (bheight, bhash) = runBlockEnv dbenv $ do
-    r <- callDb "lookupBlock" $ \db ->
-         qry db qtext [SInt $ fromIntegral bheight, SBlob (runPutS (encodeBlockHash bhash))]
+doLookupBlock :: SQLiteEnv -> (BlockHeight, BlockHash) -> IO Bool
+doLookupBlock db (bheight, bhash) = do
+    r <- qry db qtext [SInt $ fromIntegral bheight, SBlob (runPutS (encodeBlockHash bhash))]
                       [RInt]
     liftIO (expectSingle "row" r) >>= \case
-        [SInt n] -> return $! n /= 0
-        _ -> internalError "doLookupBlock: output mismatch"
+        [SInt n] -> return $! n == 1
+        _ -> internalError "doLookupBlock: output type mismatch"
   where
     qtext = "SELECT COUNT(*) FROM BlockHistory WHERE blockheight = ? \
             \ AND hash = ?;"
 
-doGetBlockParent :: ChainwebVersion -> ChainId -> Db -> (BlockHeight, BlockHash) -> IO (Maybe BlockHash)
-doGetBlockParent v cid dbenv (bh, hash)
+doGetBlockParent :: ChainwebVersion -> ChainId -> SQLiteEnv -> (BlockHeight, BlockHash) -> IO (Maybe BlockHash)
+doGetBlockParent v cid db (bh, hash)
     | bh == genesisHeight v cid = return Nothing
     | otherwise = do
-        blockFound <- doLookupBlock dbenv (bh, hash)
+        blockFound <- doLookupBlock db (bh, hash)
         if not blockFound
           then return Nothing
-          else runBlockEnv dbenv $ do
-            r <- callDb "getBlockParent" $ \db -> qry db qtext [SInt (fromIntegral (pred bh))] [RBlob]
+          else do
+            r <- qry db qtext [SInt (fromIntegral (pred bh))] [RBlob]
             case r of
               [[SBlob blob]] ->
                 either (internalError . T.pack) (return . return) $! runGetEitherS decodeBlockHash blob
-              _ -> internalError "doGetBlockParent: output mismatch"
+              [] -> internalError "doGetBlockParent: block was found but its parent couldn't be found"
+              _ -> error "doGetBlockParent: output type mismatch"
   where
     qtext = "SELECT hash FROM BlockHistory WHERE blockheight = ?"
 
 
-doRegisterSuccessful :: Db -> PactHash -> IO ()
-doRegisterSuccessful dbenv (TypedHash hash) =
-    runBlockEnv dbenv (indexPactTransaction $ BS.fromShort hash)
+doLookupSuccessful :: BlockHeight -> V.Vector PactHash -> BlockHandler logger (HashMap.HashMap PactHash (T2 BlockHeight BlockHash))
+doLookupSuccessful curHeight hashes = do
+  fmap buildResultMap $ -- swizzle results of query into a HashMap
+    callDb "doLookupSuccessful" $ \db -> do
+      let
+        hss = V.toList hashes
+        params = Utf8 $ intercalate "," (map (const "?") hss)
+        qtext = "SELECT blockheight, hash, txhash FROM \
+                \TransactionIndex INNER JOIN BlockHistory \
+                \USING (blockheight) WHERE txhash IN (" <> params <> ")"
+                <> " AND blockheight <= ?;"
+        qvals
+          -- match query params above. first, hashes
+          = map (\(TypedHash h) -> SBlob $ BS.fromShort h) hss
+          -- then, the block height; we don't want to see txs from the
+          -- current block in the db, because they'd show up in pending data
+          ++ [SInt $ fromIntegral (pred curHeight)]
 
-
-doLookupSuccessful :: Db -> PactHash -> IO (Maybe (T2 BlockHeight BlockHash))
-doLookupSuccessful dbenv (TypedHash hash) = runBlockEnv dbenv $ do
-    r <- callDb "doLookupSuccessful" $ \db ->
-         qry db qtext [ SBlob (BS.fromShort hash) ] [RInt, RBlob] >>= mapM go
-    case r of
-        [] -> return Nothing
-        (!o:_) -> return (Just o)
+      qry db qtext qvals [RInt, RBlob, RBlob] >>= mapM go
   where
-    qtext = "SELECT blockheight, hash FROM \
-            \TransactionIndex INNER JOIN BlockHistory \
-            \USING (blockheight) WHERE txhash = ?;"
-    go [SInt h, SBlob blob] = do
-        !hsh <- either fail return $ runGetEitherS decodeBlockHash blob
-        return $! T2 (fromIntegral h) hsh
+    -- NOTE: it's useful to keep the types of 'go' and 'buildResultMap' in sync
+    -- for readability but also to ensure the compiler and reader infer the
+    -- right result types from the db query.
+
+    buildResultMap :: [T3 PactHash BlockHeight BlockHash] -> HashMap.HashMap PactHash (T2 BlockHeight BlockHash)
+    buildResultMap xs = HashMap.fromList $
+      map (\(T3 txhash blockheight blockhash) -> (txhash, T2 blockheight blockhash)) xs
+
+    go :: [SType] -> IO (T3 PactHash BlockHeight BlockHash)
+    go (SInt blockheight:SBlob blockhash:SBlob txhash:_) = do
+        !blockhash' <- either fail return $ runGetEitherS decodeBlockHash blockhash
+        let !txhash' = TypedHash $ BS.toShort txhash
+        return $! T3 txhash' (fromIntegral blockheight) blockhash'
     go _ = fail "impossible"
 
-doGetBlockHistory :: FromJSON v => Db -> BlockHeader -> Domain k v -> IO BlockTxHistory
-doGetBlockHistory dbenv blockHeader d = runBlockEnv dbenv $ do
-  callDb "doGetBlockHistory" $ \db -> do
-    endTxId <- getEndTxId db bHeight (_blockHash blockHeader)
-    startTxId <- if (bHeight == genesisHeight v cid)
-      then pure 0  -- genesis block
-      else getEndTxId db (pred bHeight) (_blockParent blockHeader)
-    let tname = domainTableName d
-    history <- queryHistory db tname startTxId endTxId
-    let (!hkeys,tmap) = foldl' procTxHist (S.empty,mempty) history
-    !prev <- M.fromList . catMaybes <$> mapM (queryPrev db tname startTxId) (S.toList hkeys)
-    return $ BlockTxHistory tmap prev
+doGetBlockHistory :: SQLiteEnv -> BlockHeader -> Domain RowKey RowData -> IO BlockTxHistory
+doGetBlockHistory db blockHeader d = do
+  endTxId <- fmap fromIntegral $
+    getEndTxId "doGetBlockHistory" db (Just $ ParentHeader blockHeader)
+  startTxId <- fmap fromIntegral $
+    if bHeight == genesisHeight v cid
+    then return 0
+    else getEndTxId' "doGetBlockHistory" db (pred bHeight) (_blockParent blockHeader)
+  let tname = domainTableName d
+  history <- queryHistory tname startTxId endTxId
+  let (!hkeys,tmap) = foldl' procTxHist (S.empty,mempty) history
+  !prev <- M.fromList . catMaybes <$> mapM (queryPrev tname startTxId) (S.toList hkeys)
+  return $ BlockTxHistory tmap prev
   where
     v = _chainwebVersion blockHeader
     cid = _blockChainId blockHeader
     bHeight = _blockHeight blockHeader
 
     procTxHist
-      :: (S.Set Utf8, M.Map TxId [TxLog Value])
-      -> (Utf8,TxId,TxLog Value)
-      -> (S.Set Utf8,M.Map TxId [TxLog Value])
+      :: (S.Set Utf8, M.Map TxId [TxLog RowData])
+      -> (Utf8,TxId,TxLog RowData)
+      -> (S.Set Utf8,M.Map TxId [TxLog RowData])
     procTxHist (ks,r) (uk,t,l) = (S.insert uk ks, M.insertWith (++) t [l] r)
 
     -- Start index is inclusive, while ending index is not.
     -- `endingtxid` in a block is the beginning txid of the following block.
-    queryHistory :: Database -> Utf8 -> Int64 -> Int64 -> IO [(Utf8,TxId,TxLog Value)]
-    queryHistory db tableName s e = do
+    queryHistory :: Utf8 -> Int64 -> Int64 -> IO [(Utf8,TxId,TxLog RowData)]
+    queryHistory tableName s e = do
       let sql = "SELECT txid, rowkey, rowdata FROM [" <> tableName <>
                 "] WHERE txid >= ? AND txid < ?"
       r <- qry db sql
@@ -352,8 +394,8 @@ doGetBlockHistory dbenv blockHeader d = runBlockEnv dbenv $ do
                \result, got: " <> T.pack (show err)
 
     -- Get last tx data, if any, for key before start index.
-    queryPrev :: Database -> Utf8 -> Int64 -> Utf8 -> IO (Maybe (RowKey,TxLog Value))
-    queryPrev db tableName s k@(Utf8 sk) = do
+    queryPrev :: Utf8 -> Int64 -> Utf8 -> IO (Maybe (RowKey,TxLog RowData))
+    queryPrev tableName s k@(Utf8 sk) = do
       let sql = "SELECT rowdata FROM [" <> tableName <>
                 "] WHERE rowkey = ? AND txid < ? " <>
                 "ORDER BY txid DESC LIMIT 1"
@@ -366,35 +408,20 @@ doGetBlockHistory dbenv blockHeader d = runBlockEnv dbenv $ do
         _ -> internalError $ "queryPrev: expected 0 or 1 rows, got: " <> T.pack (show r)
 
 
-getEndTxId :: Database -> BlockHeight -> BlockHash -> IO Int64
-getEndTxId db bhi bha = do
-  r <- qry db
-    "SELECT endingtxid FROM BlockHistory WHERE blockheight = ? and hash = ?;"
-    [SInt $ fromIntegral bhi, SBlob $ runPutS (encodeBlockHash bha)]
-    [RInt]
-  case r of
-    [[SInt tid]] -> return tid
-    [] -> throwM $ BlockHeaderLookupFailure $ "doGetBlockHistory: not in db: " <>
-          sshow (bhi,bha)
-    _ -> internalError $ "doGetBlockHistory: expected single-row int result, got " <> sshow r
-
 doGetHistoricalLookup
-    :: FromJSON v
-    => Db
+    :: SQLiteEnv
     -> BlockHeader
-    -> Domain k v
+    -> Domain RowKey RowData
     -> RowKey
-    -> IO (Maybe (TxLog Value))
-doGetHistoricalLookup dbenv blockHeader d k = runBlockEnv dbenv $ do
-  callDb "doGetHistoricalLookup" $ \db -> do
-    endTxId <- getEndTxId db bHeight (_blockHash blockHeader)
-    latestEntry <- queryHistoryLookup db (domainTableName d) endTxId (convRowKey k)
-    return $! latestEntry
+    -> IO (Maybe (TxLog RowData))
+doGetHistoricalLookup db blockHeader d k = do
+  endTxId <-
+    fromIntegral <$> getEndTxId "doGetHistoricalLookup" db (Just $ ParentHeader blockHeader)
+  latestEntry <- queryHistoryLookup (domainTableName d) endTxId (convRowKey k)
+  return $! latestEntry
   where
-    bHeight = _blockHeight blockHeader
-
-    queryHistoryLookup :: Database -> Utf8 -> Int64 -> Utf8 -> IO (Maybe (TxLog Value))
-    queryHistoryLookup db tableName e rowKeyName = do
+    queryHistoryLookup :: Utf8 -> Int64 -> Utf8 -> IO (Maybe (TxLog RowData))
+    queryHistoryLookup tableName e rowKeyName = do
       let sql = "SELECT rowKey, rowdata FROM [" <> tableName <>
                 "] WHERE txid < ? AND rowkey = ? ORDER BY txid DESC LIMIT 1;"
       r <- qry db sql

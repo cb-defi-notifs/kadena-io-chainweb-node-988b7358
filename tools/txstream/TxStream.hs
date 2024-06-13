@@ -12,6 +12,7 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TupleSections #-}
 
 -- |
 -- Module: TxStream
@@ -35,8 +36,8 @@ import Chainweb.Payload.RestAPI.Client
 
 import Configuration.Utils
 
-import Control.Arrow ((&&&))
 import Control.Lens hiding ((.=))
+import Control.Monad ((<=<), when)
 import Control.Monad.Reader
 
 import Data.Aeson.Encode.Pretty hiding (Config)
@@ -73,12 +74,13 @@ import Chainweb.TreeDB
 import Chainweb.TreeDB.RemoteDB
 import Chainweb.Utils
 import Chainweb.Version
-import Chainweb.Version.Development
+import Chainweb.Version.RecapDevelopment
 import Chainweb.Version.Registry
 import Chainweb.Version.Utils
 
 import Data.LogMessage
 
+import qualified Pact.JSON.Encode as J
 import Pact.Types.Command
 
 -- -------------------------------------------------------------------------- --
@@ -107,8 +109,8 @@ defaultConfig :: Config
 defaultConfig = Config
     { _configLogHandle = Y.StdOut
     , _configLogLevel = Y.Info
-    , _configChainwebVersion = Development
-    , _configChainId = someChainId Development
+    , _configChainwebVersion = RecapDevelopment
+    , _configChainId = someChainId RecapDevelopment
     , _configNode = HostAddress (unsafeHostnameFromText "us1.tn1.chainweb.com") 443
     , _configPretty = True
     , _configOutputs = True
@@ -233,8 +235,8 @@ prettyCommand p (bh, c) = T.decodeUtf8
     $ (if p then encodePretty else encode)
     $ object
         [ "height" .= bh
-        , "sigs" .= _cmdSigs c
-        , "hash" .= _cmdHash c
+        , "sigs" .= fmap J.toJsonViaEncode (_cmdSigs c)
+        , "hash" .= J.toJsonViaEncode (_cmdHash c)
         , "payload" .= either
             (const $ String $ _cmdPayload c)
             (id @Value)
@@ -258,7 +260,7 @@ txStream config mgr logg = do
                 (\x -> when (_blockHeight x `mod` 100 == 0) $
                     logg @T.Text Info ("BlockHeight: " <> sshow (_blockHeight x))
                 )
-            & S.mapM (traverse (devNetPayload config mgr) . (_blockHeight &&& _blockPayloadHash))
+            & S.mapM (\x -> (_blockHeight x,) <$> devNetPayload config mgr (_blockHeight x) (_blockPayloadHash x))
             & flip S.for (S.each . traverse _payloadDataTransactions)
             & S.map (fmap _transactionBytes)
             & S.mapM (traverse decodeStrictOrThrow')
@@ -287,13 +289,13 @@ prettyCommandWithOutputs p (bh, c, o) = T.decodeUtf8
     $ (if p then encodePretty else encode)
     $ object
         [ "height" .= bh
-        , "sigs" .= _cmdSigs c
-        , "hash" .= _cmdHash c
+        , "sigs" .= fmap J.toJsonViaEncode (_cmdSigs c)
+        , "hash" .= J.toJsonViaEncode (_cmdHash c)
         , "payload" .= either
             (const $ String $ _cmdPayload c)
             (id @Value)
             (eitherDecodeStrict' $ T.encodeUtf8 $ _cmdPayload $ c)
-        , "output" .= o
+        , "output" .= J.toJsonViaEncode o
         ]
 
 txOutputsStream
@@ -313,10 +315,8 @@ txOutputsStream config mgr logg = do
                 (\x -> when (_blockHeight x `mod` 100 == 0) $
                     logg @T.Text Info ("BlockHeight: " <> sshow (_blockHeight x))
                 )
-            & S.mapM
-                ( traverse (devNetPayloadWithOutput config mgr)
-                . (_blockHeight &&& _blockPayloadHash)
-                )
+
+            & S.mapM (\x -> (_blockHeight x,) <$> devNetPayloadWithOutput config mgr (_blockHeight x) (_blockPayloadHash x))
             & flip S.for
                 ( S.each
                 . traverse _payloadWithOutputsTransactions
@@ -339,8 +339,8 @@ devNetCut config mgr = runClientM (cutGetClient ver) (env mgr node) >>= \case
 -- -------------------------------------------------------------------------- --
 -- Payloads
 
-devNetPayload :: Config -> Manager -> BlockPayloadHash -> IO PayloadData
-devNetPayload config  mgr x = runClientM (payloadClient ver cid x) (env mgr node) >>= \case
+devNetPayload :: Config -> Manager -> BlockHeight -> BlockPayloadHash -> IO PayloadData
+devNetPayload config mgr h x = runClientM (payloadClient ver cid x (Just h)) (env mgr node) >>= \case
     Left e -> error (show e)
     Right a -> return a
   where
@@ -348,9 +348,9 @@ devNetPayload config  mgr x = runClientM (payloadClient ver cid x) (env mgr node
     ver = _configChainwebVersion config
     node = _configNode config
 
-devNetPayloadWithOutput :: Config -> Manager -> BlockPayloadHash -> IO PayloadWithOutputs
-devNetPayloadWithOutput config mgr x
-    = runClientM (outputsClient ver cid x) (env mgr node) >>= \case
+devNetPayloadWithOutput :: Config -> Manager -> BlockHeight -> BlockPayloadHash -> IO PayloadWithOutputs
+devNetPayloadWithOutput config mgr h x
+    = runClientM (outputsClient ver cid x (Just h)) (env mgr node) >>= \case
         Left e -> error (show e)
         Right a -> return a
   where

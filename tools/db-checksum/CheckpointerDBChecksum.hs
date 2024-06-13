@@ -15,6 +15,7 @@ module CheckpointerDBChecksum where
 import Configuration.Utils hiding (Error, Lens', action, encode)
 
 import Control.Exception.Safe (tryAny)
+import Control.Monad (foldM, when, void)
 import Control.Monad.Reader
 
 import Crypto.Hash
@@ -198,7 +199,7 @@ work args = withSQLiteConnection (_sqliteFile args) chainwebPragmas (runReaderT 
 
 callDb :: T.Text -> (Database -> IO a) -> ReaderT SQLiteEnv IO a
 callDb callerName action = do
-    c <- asks _sConn
+    c <- ask
     tryAny (liftIO $ action c) >>= \case
       Left err -> internalError $ "callDb (" <> callerName <> "): " <> sshow err
       Right r -> return r

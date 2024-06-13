@@ -14,7 +14,6 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE TypeInType #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE UndecidableSuperClasses #-}
@@ -126,7 +125,8 @@ data ChainGraphException :: Type where
         -> Actual (HS.HashSet ChainId)
         -> ChainGraphException
     ChainNotAdjacentException
-        :: Expected ChainId
+        :: ChainId
+        -> Expected ChainId
         -> Actual (HS.HashSet ChainId)
         -> ChainGraphException
     deriving (Show, Eq, Generic)
@@ -185,7 +185,7 @@ validChainGraph g
     && (G.order g <= 1 || G.symSize g >= 1)
 {-# INLINE validChainGraph #-}
 
--- | Returns an empty set of the chain id is not in the graph
+-- | Returns an empty set if the chain id is not in the graph
 --
 adjacentChainIds
     :: HasChainId p

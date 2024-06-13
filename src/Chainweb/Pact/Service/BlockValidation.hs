@@ -21,16 +21,16 @@ module Chainweb.Pact.Service.BlockValidation
 , pactBlockTxHistory
 , pactHistoricalLookup
 , pactSyncToBlock
+, pactReadOnlyReplay
 ) where
 
 
-import Control.Concurrent.MVar.Strict
-
-import Data.Aeson (Value)
 import Data.Vector (Vector)
+import Data.HashMap.Strict (HashMap)
 
 import Pact.Types.Hash
-import Pact.Types.Persistence (RowKey, TxLog)
+import Pact.Types.Persistence (RowKey, TxLog, Domain)
+import Pact.Types.RowData (RowData)
 
 import Chainweb.BlockHash
 import Chainweb.BlockHeader
@@ -44,30 +44,24 @@ import Chainweb.Transaction
 import Chainweb.Utils (T2)
 
 
-newBlock :: Miner -> ParentHeader -> PactQueue ->
-            IO (MVar (Either PactException PayloadWithOutputs))
-newBlock mi bHeader reqQ = do
-    !resultVar <- newEmptyMVar :: IO (MVar (Either PactException PayloadWithOutputs))
+newBlock :: Miner -> PactQueue ->
+            IO (T2 ParentHeader PayloadWithOutputs)
+newBlock mi reqQ = do
     let !msg = NewBlockMsg NewBlockReq
-          { _newBlockHeader = bHeader
-          , _newMiner = mi
-          , _newResultVar = resultVar }
-    addRequest reqQ msg
-    return resultVar
+          { _newMiner = mi }
+    submitRequestAndWait reqQ msg
 
 validateBlock
     :: BlockHeader
-    -> PayloadData
+    -> CheckablePayload
     -> PactQueue
-    -> IO (MVar (Either PactException PayloadWithOutputs))
-validateBlock bHeader plData reqQ = do
-    !resultVar <- newEmptyMVar :: IO (MVar (Either PactException PayloadWithOutputs))
+    -> IO PayloadWithOutputs
+validateBlock bHeader payload reqQ = do
     let !msg = ValidateBlockMsg ValidateBlockReq
           { _valBlockHeader = bHeader
-          , _valResultVar = resultVar
-          , _valPayloadData = plData }
-    addRequest reqQ msg
-    return resultVar
+          , _valCheckablePayload = payload
+          }
+    submitRequestAndWait reqQ msg
 
 local
     :: Maybe LocalPreflightSimulation
@@ -75,75 +69,74 @@ local
     -> Maybe RewindDepth
     -> ChainwebTransaction
     -> PactQueue
-    -> IO (MVar (Either PactException LocalResult))
+    -> IO LocalResult
 local preflight sigVerify rd ct reqQ = do
-    !resultVar <- newEmptyMVar
     let !msg = LocalMsg LocalReq
           { _localRequest = ct
           , _localPreflight = preflight
           , _localSigVerification = sigVerify
           , _localRewindDepth = rd
-          , _localResultVar = resultVar }
-    addRequest reqQ msg
-    return resultVar
+          }
+    submitRequestAndWait reqQ msg
 
 lookupPactTxs
-    :: Rewind
+    :: Maybe ConfirmationDepth
     -> Vector PactHash
     -> PactQueue
-    -> IO (MVar (Either PactException (Vector (Maybe (T2 BlockHeight BlockHash)))))
-lookupPactTxs restorePoint txs reqQ = do
-    resultVar <- newEmptyMVar
-    let !req = LookupPactTxsReq restorePoint txs resultVar
+    -> IO (HashMap PactHash (T2 BlockHeight BlockHash))
+lookupPactTxs confDepth txs reqQ = do
+    let !req = LookupPactTxsReq confDepth txs
     let !msg = LookupPactTxsMsg req
-    addRequest reqQ msg
-    return resultVar
+    submitRequestAndWait reqQ msg
+
+pactReadOnlyReplay
+    :: BlockHeader
+    -> Maybe BlockHeader
+    -> PactQueue
+    -> IO ()
+pactReadOnlyReplay l u reqQ = do
+    let !msg = ReadOnlyReplayMsg ReadOnlyReplayReq
+          { _readOnlyReplayLowerBound = l
+          , _readOnlyReplayUpperBound = u
+          }
+    submitRequestAndWait reqQ msg
 
 pactPreInsertCheck
     :: Vector ChainwebTransaction
     -> PactQueue
-    -> IO (MVar (Either PactException (Vector (Either InsertError ()))))
+    -> IO (Vector (Either InsertError ()))
 pactPreInsertCheck txs reqQ = do
-    resultVar <- newEmptyMVar
-    let !req = PreInsertCheckReq txs resultVar
+    let !req = PreInsertCheckReq txs
     let !msg = PreInsertCheckMsg req
-    addRequest reqQ msg
-    return resultVar
+    submitRequestAndWait reqQ msg
 
 pactBlockTxHistory
   :: BlockHeader
-  -> Domain'
+  -> Domain RowKey RowData
   -> PactQueue
-  -> IO (MVar (Either PactException BlockTxHistory))
+  -> IO BlockTxHistory
 pactBlockTxHistory bh d reqQ = do
-  resultVar <- newEmptyMVar
-  let !req = BlockTxHistoryReq bh d resultVar
+  let !req = BlockTxHistoryReq bh d
   let !msg = BlockTxHistoryMsg req
-  addRequest reqQ msg
-  return resultVar
+  submitRequestAndWait reqQ msg
 
 pactHistoricalLookup
     :: BlockHeader
-    -> Domain'
+    -> Domain RowKey RowData
     -> RowKey
     -> PactQueue
-    -> IO (MVar (Either PactException (Maybe (TxLog Value))))
+    -> IO (Maybe (TxLog RowData))
 pactHistoricalLookup bh d k reqQ = do
-  resultVar <- newEmptyMVar
-  let !req = HistoricalLookupReq bh d k resultVar
+  let !req = HistoricalLookupReq bh d k
   let !msg = HistoricalLookupMsg req
-  addRequest reqQ msg
-  return resultVar
+  submitRequestAndWait reqQ msg
 
 pactSyncToBlock
     :: BlockHeader
     -> PactQueue
-    -> IO (MVar (Either PactException ()))
+    -> IO ()
 pactSyncToBlock bh reqQ = do
-    !resultVar <- newEmptyMVar
     let !msg = SyncToBlockMsg SyncToBlockReq
           { _syncToBlockHeader = bh
-          , _syncToResultVar = resultVar
           }
-    addRequest reqQ msg
-    return resultVar
+    submitRequestAndWait reqQ msg

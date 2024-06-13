@@ -71,6 +71,8 @@ import Chainweb.Time
 import Chainweb.Utils
 import Chainweb.Version (ChainwebVersion)
 
+import qualified Pact.Types.ChainMeta as P
+
 import Numeric.AffineSpace
 
 ------------------------------------------------------------------------------
@@ -186,7 +188,7 @@ withInMemoryMempool_ l cfg _v f = do
   where
     monitor m = do
         let lf = logFunction l
-        logFunctionText l Info "Initialized Mempool Monitor"
+        logFunctionText l Debug "Initialized Mempool Monitor"
         runForeverThrottled lf "Chainweb.Mempool.InMem.withInMemoryMempool_.monitor" 10 (10 * mega) $ do
             stats <- getMempoolStats m
             logFunctionText l Debug "got stats"
@@ -248,8 +250,8 @@ markValidatedInMem logger tcfg lock txs = withMVarMasked lock $ \mdata -> do
     x <- readIORef curTxIdxRef
     !x' <- currentTxsInsertBatch x (V.zip expiries hashes)
     when (currentTxsSize x /= currentTxsSize x') $ do
-      logg Info $ "previous current tx index size: " <> sshow (currentTxsSize x)
-      logg Info $ "new current tx index size: " <> sshow (currentTxsSize x')
+      logg Debug $ "previous current tx index size: " <> sshow (currentTxsSize x)
+      logg Debug $ "new current tx index size: " <> sshow (currentTxsSize x')
     writeIORef curTxIdxRef x'
   where
     hashes = txHasher tcfg <$> txs
@@ -267,7 +269,7 @@ addToBadListInMem lock txs = withMVarMasked lock $ \mdata -> do
     let !pnd' = foldl' (flip HashMap.delete) pnd txs
     -- we don't have the expiry time here, so just use maxTTL
     now <- getCurrentTimeIntegral
-    let (ParsedInteger mt) = defaultMaxTTL
+    let P.TTLSeconds (ParsedInteger mt) = defaultMaxTTL
     let !endTime = add (secondsToTimeSpan $ fromIntegral mt) now
     let !bad' = foldl' (\h tx -> HashMap.insert tx endTime h) bad txs
     writeIORef (_inmemPending mdata) pnd'
@@ -412,8 +414,9 @@ validateOne cfg badmap curTxIdx now t h =
 -- doesn't guarantee succesfull validation in the context of a block.
 --
 txTTLCheck :: TransactionConfig t -> Time Micros -> t -> Either InsertError ()
-txTTLCheck txcfg now t =
-    ebool_ InsertErrorInvalidTime (ct < now .+^ gracePeriod && now < et && ct < et)
+txTTLCheck txcfg now t = do
+    ebool_ InsertErrorTimeInFuture (ct < now .+^ gracePeriod)
+    ebool_ InsertErrorTTLExpired (now < et && ct < et)
   where
     TransactionMetadata ct et = txMetadata txcfg t
     gracePeriod = scaleTimeSpan @Int 10 second

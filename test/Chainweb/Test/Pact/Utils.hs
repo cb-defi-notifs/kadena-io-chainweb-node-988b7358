@@ -1,17 +1,21 @@
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE NumericUnderscores #-}
+{-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
-
+{-# LANGUAGE ViewPatterns #-}
 
 {-# OPTIONS_GHC -fno-warn-incomplete-uni-patterns #-}
 -- |
@@ -28,6 +32,9 @@ module Chainweb.Test.Pact.Utils
 , sender00
 , sender01
 , sender00Ks
+, sender02WebAuthn
+, sender02WebAuthnPrefixed
+, sender03WebAuthn
 , allocation00KeyPair
 , testKeyPairs
 , mkKeySetData
@@ -54,8 +61,6 @@ module Chainweb.Test.Pact.Utils
 , mkXChainTransferCap
 -- * Command builder
 , defaultCmd
-, mkCmd
-, buildRawCmd
 , buildCwCmd
 , buildTextCmd
 , mkExec'
@@ -63,13 +68,15 @@ module Chainweb.Test.Pact.Utils
 , mkCont
 , mkContMsg
 , ContMsg (..)
-, mkSigner
-, mkSigner'
+, mkEd25519Signer
+, mkEd25519Signer'
+, mkWebAuthnSigner
+, mkWebAuthnSigner'
 , CmdBuilder(..)
 , cbSigners
+, cbVerifiers
 , cbRPC
 , cbNonce
-, cbNetworkId
 , cbChainId
 , cbSender
 , cbGasLimit
@@ -81,6 +88,7 @@ module Chainweb.Test.Pact.Utils
 , csPrivKey
 -- * Pact Service creation
 , withPactTestBlockDb
+, withPactTestBlockDb'
 , withWebPactExecutionService
 , withPactCtxSQLite
 , WithPactCtxSQLite
@@ -88,13 +96,10 @@ module Chainweb.Test.Pact.Utils
 , initializeSQLite
 , freeSQLiteResource
 , freeGasModel
-, withTestBlockDbTest
-, defaultPactServiceConfig
-, withMVarResource
-, withTime
-, withPayloadDb
+, testPactServiceConfig
 , withBlockHeaderDb
 , withTemporaryDir
+, withSqliteDb
 -- * Mempool utils
 , delegateMemPoolAccess
 , withDelegateMempool
@@ -104,26 +109,33 @@ module Chainweb.Test.Pact.Utils
 , runCut
 , Noncer
 , zeroNoncer
+-- * Pact State
+, compact
+, compactUntilAvailable
+, PactRow(..)
+, getLatestPactState
+, getPactUserTables
 -- * miscellaneous
 , toTxCreationTime
 , dummyLogger
+, hunitDummyLogger
 , pactTestLogger
-, epochCreationTime
 , someTestVersionHeader
 , someBlockHeader
 , testPactFilesDir
+, getPWOByHeader
 
 ) where
 
 import Control.Arrow ((&&&))
 import Control.Concurrent.Async
 import Control.Concurrent.MVar
-import Control.Lens (view, _3, makeLenses)
+import Control.Lens hiding ((.=))
 import Control.Monad
 import Control.Monad.Catch
 import Control.Monad.IO.Class
 
-import Data.Aeson (Value(..), object, (.=))
+import Data.Aeson (Value(..), object, (.=), Key)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Short as BS
 import Data.Decimal
@@ -131,6 +143,9 @@ import Data.Default (def)
 import Data.Foldable
 import qualified Data.HashMap.Strict as HM
 import Data.IORef
+import Data.List qualified as List
+import Data.LogMessage
+import Data.Map (Map)
 import qualified Data.Map.Strict as M
 import Data.Maybe
 import Data.Text (Text)
@@ -139,10 +154,15 @@ import qualified Data.Text.Encoding as T
 import Data.String
 import qualified Data.Vector as V
 
-import GHC.Generics
+import Database.SQLite3.Direct (Database)
 
+import GHC.Generics
+import GHC.IO.Exception(IOException(..))
+
+import Streaming.Prelude qualified as S
 import System.Directory
 import System.IO.Temp (createTempDirectory)
+import qualified System.Logger as YAL
 import System.LogLevel
 
 import Test.Tasty
@@ -151,6 +171,7 @@ import Test.Tasty
 
 import Pact.ApiReq (ApiKeyPair(..), mkKeyPairs)
 import Pact.Gas
+import Pact.JSON.Legacy.Value
 import Pact.Types.Capability
 import qualified Pact.Types.ChainId as P
 import Pact.Types.ChainMeta
@@ -159,19 +180,18 @@ import Pact.Types.Crypto
 import Pact.Types.Exp
 import Pact.Types.Gas
 import Pact.Types.Hash
-import Pact.Types.Logger
+import Pact.Types.KeySet
+import qualified Pact.Types.Logger as P
 import Pact.Types.Names
 import Pact.Types.PactValue
 import Pact.Types.RPC
 import Pact.Types.Runtime (PactEvent(..))
-import Pact.Types.SPV
 import Pact.Types.Term
-import Pact.Types.SQLite
 import Pact.Types.Util (parseB16TextOnly)
+import Pact.Types.Verifier
 
 -- internal modules
 
-import Chainweb.BlockCreationTime
 import Chainweb.BlockHeader
 import Chainweb.BlockHeaderDB hiding (withBlockHeaderDb)
 import Chainweb.BlockHeight
@@ -179,18 +199,20 @@ import Chainweb.ChainId
 import Chainweb.Graph
 import Chainweb.Logger
 import Chainweb.Miner.Pact
-import Chainweb.Pact.Backend.RelationalCheckpointer
-    (initRelationalCheckpointer')
+import Chainweb.Pact.Backend.Compaction qualified as C
+import Chainweb.Pact.Backend.PactState qualified as PactState
+import Chainweb.Pact.Backend.PactState (TableDiffable(..), Table(..), PactRow(..))
+import Chainweb.Pact.Backend.RelationalCheckpointer (initRelationalCheckpointer)
 import Chainweb.Pact.Backend.SQLite.DirectV2
 import Chainweb.Pact.Backend.Types
-import Chainweb.Pact.Backend.Utils
+import Chainweb.Pact.Backend.Utils hiding (withSqliteDb)
 import Chainweb.Pact.PactService
+import Chainweb.Pact.RestAPI.Server (validateCommand)
 import Chainweb.Pact.Service.PactQueue
 import Chainweb.Pact.Service.Types
 import Chainweb.Pact.Types
 import Chainweb.Payload
 import Chainweb.Payload.PayloadStore
-import Chainweb.Payload.PayloadStore.InMemory
 import Chainweb.Test.Cut
 import Chainweb.Test.Cut.TestBlockDb
 import Chainweb.Test.Utils
@@ -205,20 +227,12 @@ import Chainweb.Version.Utils (someChainId)
 import Chainweb.WebBlockHeaderDB
 import Chainweb.WebPactExecutionService
 
-import Chainweb.Storage.Table.HashMap hiding (toList)
 import Chainweb.Storage.Table.RocksDB
 
 -- ----------------------------------------------------------------------- --
 -- Keys
 
 type SimpleKeyPair = (Text,Text)
-
--- | Legacy; better to use 'CmdSigner'/'CmdBuilder'.
--- if caps are empty, gas cap is implicit. otherwise it must be included
-testKeyPairs :: SimpleKeyPair -> Maybe [SigCapability] -> IO [SomeKeyPairCaps]
-testKeyPairs skp capsm = do
-  kp <- toApiKp $ mkSigner' skp (fromMaybe [] capsm)
-  mkKeyPairs [kp]
 
 testPactFilesDir :: FilePath
 testPactFilesDir = "test/pact/"
@@ -231,6 +245,20 @@ sender01 :: SimpleKeyPair
 sender01 = ("6be2f485a7af75fedb4b7f153a903f7e6000ca4aa501179c91a2450b777bd2a7"
            ,"2beae45b29e850e6b1882ae245b0bab7d0689ebdd0cd777d4314d24d7024b4f7")
 
+sender02WebAuthnPrefixed :: SimpleKeyPair
+sender02WebAuthnPrefixed =
+           ("WEBAUTHN-a4010103272006215820c18831c6f15306d6271e154842906b68f26c1af79b132dde6f6add79710303bf"
+           ,"fecd4feb1243d715d095e24713875ca76c476f8672ec487be8e3bc110dd329ab")
+
+sender02WebAuthn :: SimpleKeyPair
+sender02WebAuthn =
+           ("a4010103272006215820c18831c6f15306d6271e154842906b68f26c1af79b132dde6f6add79710303bf"
+           ,"fecd4feb1243d715d095e24713875ca76c476f8672ec487be8e3bc110dd329ab")
+
+sender03WebAuthn :: SimpleKeyPair
+sender03WebAuthn =
+           ("a4010103272006215820ad72392508272b4c45536976474cdd434e772bfd630738ee9aac7343e7222eb6"
+           ,"ebe7d1119a53863fa64be7347d82d9fcc9ebeb8cbbe480f5e8642c5c36831434")
 
 allocation00KeyPair :: SimpleKeyPair
 allocation00KeyPair =
@@ -240,7 +268,7 @@ allocation00KeyPair =
 
 
 -- | Make trivial keyset data
-mkKeySetData :: Text  -> [SimpleKeyPair] -> Value
+mkKeySetData :: Key  -> [SimpleKeyPair] -> Value
 mkKeySetData name keys = object [ name .= map fst keys ]
 
 sender00Ks :: KeySet
@@ -456,12 +484,14 @@ data CmdSigner = CmdSigner
   { _csSigner :: !Signer
   , _csPrivKey :: !Text
   } deriving (Eq,Show,Ord,Generic)
+makeLenses ''CmdSigner
 
 -- | Make ED25519 signer.
-mkSigner :: Text -> Text -> [SigCapability] -> CmdSigner
-mkSigner pubKey privKey caps = CmdSigner
+mkEd25519Signer :: Text -> Text -> [SigCapability] -> CmdSigner
+mkEd25519Signer pubKey privKey caps = CmdSigner
   { _csSigner = signer
-  , _csPrivKey = privKey }
+  , _csPrivKey = privKey
+  }
   where
     signer = Signer
       { _siScheme = Nothing
@@ -469,15 +499,30 @@ mkSigner pubKey privKey caps = CmdSigner
       , _siAddress = Nothing
       , _siCapList = caps }
 
-mkSigner' :: SimpleKeyPair -> [SigCapability] -> CmdSigner
-mkSigner' (pub,priv) = mkSigner pub priv
+mkEd25519Signer' :: SimpleKeyPair -> [SigCapability] -> CmdSigner
+mkEd25519Signer' (pub,priv) = mkEd25519Signer pub priv
+
+mkWebAuthnSigner :: Text -> Text -> [SigCapability] -> CmdSigner
+mkWebAuthnSigner pubKey privKey caps = CmdSigner
+  { _csSigner = signer
+  , _csPrivKey = privKey
+  }
+  where
+    signer = Signer
+      { _siScheme = Just WebAuthn
+      , _siPubKey = pubKey
+      , _siAddress = Nothing
+      , _siCapList = caps }
+
+mkWebAuthnSigner' :: SimpleKeyPair -> [SigCapability] -> CmdSigner
+mkWebAuthnSigner' (pub, priv) caps = mkWebAuthnSigner pub priv caps
 
 -- | Chainweb-oriented command builder.
 data CmdBuilder = CmdBuilder
   { _cbSigners :: ![CmdSigner]
+  , _cbVerifiers :: ![Verifier ParsedVerifierProof]
   , _cbRPC :: !(PactRPC Text)
   , _cbNonce :: !Text
-  , _cbNetworkId :: !(Maybe ChainwebVersion)
   , _cbChainId :: !ChainId
   , _cbSender :: !Text
   , _cbGasLimit :: !GasLimit
@@ -485,6 +530,7 @@ data CmdBuilder = CmdBuilder
   , _cbTTL :: !TTLSeconds
   , _cbCreationTime :: !TxCreationTime
   } deriving (Eq,Show,Generic)
+makeLenses ''CmdBuilder
 
 -- | Make code-only Exec PactRPC
 mkExec' :: Text -> PactRPC Text
@@ -492,7 +538,7 @@ mkExec' ecode = mkExec ecode Null
 
 -- | Make Exec PactRPC
 mkExec :: Text -> Value -> PactRPC Text
-mkExec ecode edata = Exec $ ExecMsg ecode edata
+mkExec ecode edata = Exec $ ExecMsg ecode (toLegacyJson edata)
 
 mkCont :: ContMsg -> PactRPC Text
 mkCont = Continuation
@@ -502,16 +548,16 @@ mkContMsg pid step = ContMsg
   { _cmPactId = pid
   , _cmStep = step
   , _cmRollback = False
-  , _cmData = Null
+  , _cmData = toLegacyJson Null
   , _cmProof = Nothing }
 
 -- | Default builder.
 defaultCmd :: CmdBuilder
 defaultCmd = CmdBuilder
   { _cbSigners = []
+  , _cbVerifiers = []
   , _cbRPC = mkExec' "1"
   , _cbNonce = "nonce"
-  , _cbNetworkId = Nothing
   , _cbChainId = unsafeChainId 0
   , _cbSender = "sender00"
   , _cbGasLimit = 10_000
@@ -520,84 +566,103 @@ defaultCmd = CmdBuilder
   , _cbCreationTime = 0 -- epoch
   }
 
--- | Default builder with nonce and RPC
-mkCmd :: Text -> PactRPC Text -> CmdBuilder
-mkCmd nonce rpc = defaultCmd
-  { _cbRPC = rpc
-  , _cbNonce = nonce
-  }
-
 -- | Build parsed + verified Pact command
 --
-buildCwCmd :: (MonadThrow m, MonadIO m) => CmdBuilder -> m ChainwebTransaction
-buildCwCmd cmd = buildRawCmd cmd >>= \c -> case verifyCommand c of
-    ProcSucc r -> return $ fmap (mkPayloadWithText c) r
-    ProcFail e -> throwM $ userError $ "buildCmd failed: " ++ e
-
-
+-- TODO: Use the new `assertCommand` function.
+buildCwCmd :: (MonadThrow m, MonadIO m) => Text -> ChainwebVersion -> CmdBuilder -> m ChainwebTransaction
+buildCwCmd nonce v cmd = buildRawCmd nonce v cmd >>= \(c :: Command ByteString) ->
+  case validateCommand v (_cbChainId cmd) (T.decodeUtf8 <$> c) of
+    Left err -> throwM $ userError $ "buildCmd failed: " ++ err
+    Right cmd' -> return cmd'
 
 -- | Build unparsed, unverified command
 --
-buildTextCmd :: CmdBuilder -> IO (Command Text)
-buildTextCmd = fmap (fmap T.decodeUtf8) . buildRawCmd
+buildTextCmd :: Text -> ChainwebVersion -> CmdBuilder -> IO (Command Text)
+buildTextCmd nonce v = fmap (fmap T.decodeUtf8) . buildRawCmd nonce v
 
 -- | Build a raw bytestring command
 --
-buildRawCmd :: (MonadThrow m, MonadIO m) => CmdBuilder -> m (Command ByteString)
-buildRawCmd CmdBuilder{..} = do
-    akps <- mapM toApiKp _cbSigners
-    kps <- liftIO $ mkKeyPairs akps
-    liftIO $ mkCommand kps pm _cbNonce nid _cbRPC
+buildRawCmd :: (MonadThrow m, MonadIO m) => Text -> ChainwebVersion -> CmdBuilder -> m (Command ByteString)
+buildRawCmd nonce v (set cbNonce nonce -> CmdBuilder{..}) = do
+    kps <- liftIO $ traverse mkDynKeyPairs _cbSigners
+    cmd <- liftIO $ mkCommandWithDynKeys kps _cbVerifiers pm _cbNonce (Just nid) _cbRPC
+    pure cmd
   where
-    nid = fmap (P.NetworkId . sshow) _cbNetworkId
+    nid = P.NetworkId (sshow v)
     cid = fromString $ show (chainIdInt _cbChainId :: Int)
     pm = PublicMeta cid _cbSender _cbGasLimit _cbGasPrice _cbTTL _cbCreationTime
 
 dieL :: MonadThrow m => [Char] -> Either [Char] a -> m a
 dieL msg = either (\s -> throwM $ userError $ msg ++ ": " ++ s) return
 
+mkDynKeyPairs :: MonadThrow m => CmdSigner -> m (DynKeyPair, [SigCapability])
+mkDynKeyPairs (CmdSigner Signer{..} privKey) =
+  case (fromMaybe ED25519 _siScheme, _siPubKey, privKey) of
+    (ED25519, pub, priv) -> do
+      pub' <- either diePubKey return $ parseEd25519PubKey =<< parseB16TextOnly pub
+      priv' <- either diePrivKey return $ parseEd25519SecretKey =<< parseB16TextOnly priv
+      return $ (DynEd25519KeyPair (pub', priv'), _siCapList)
+
+    (WebAuthn, pub, priv) -> do
+      let (pubKeyStripped, wasPrefixed) = fromMaybe
+            (pub, WebAuthnPubKeyBare)
+            ((,WebAuthnPubKeyPrefixed) <$> T.stripPrefix webAuthnPrefix pub)
+      pubWebAuthn <-
+        either diePubKey return (parseWebAuthnPublicKey =<< parseB16TextOnly pubKeyStripped)
+      privWebAuthn <-
+        either diePrivKey return (parseWebAuthnPrivateKey =<< parseB16TextOnly priv)
+      return $ (DynWebAuthnKeyPair wasPrefixed pubWebAuthn privWebAuthn, _siCapList)
+  where
+    diePubKey str = error $ "pubkey: " <> str
+    diePrivKey str = error $ "privkey: " <> str
+
 toApiKp :: MonadThrow m => CmdSigner -> m ApiKeyPair
 toApiKp (CmdSigner Signer{..} privKey) = do
   sk <- dieL "private key" $ parseB16TextOnly privKey
   pk <- dieL "public key" $ parseB16TextOnly _siPubKey
-  return $!
-    ApiKeyPair (PrivBS sk) (Just (PubBS pk)) _siAddress _siScheme (Just _siCapList)
+  let keyPair = ApiKeyPair (PrivBS sk) (Just (PubBS pk)) _siAddress _siScheme (Just _siCapList)
+  return $! keyPair
+
+-- | Legacy; better to use 'CmdSigner'/'CmdBuilder'.
+-- if caps are empty, gas cap is implicit. otherwise it must be included
+testKeyPairs :: SimpleKeyPair -> Maybe [SigCapability] -> IO [(DynKeyPair, [SigCapability])]
+testKeyPairs skp capsm = do
+  kp <- toApiKp $ mkEd25519Signer' skp (fromMaybe [] capsm)
+  mkKeyPairs [kp]
 
 -- ----------------------------------------------------------------------- --
 -- Service creation utilities
 
-
-pactTestLogger :: (String -> IO ()) -> Bool -> Loggers
-pactTestLogger backend showAll = initLoggers backend f def
+pactTestLogger :: (String -> IO ()) -> Bool -> P.Loggers
+pactTestLogger backend showAll = P.initLoggers backend f def
   where
-    f _ b "ERROR" d = doLog (\_ -> return ()) b "ERROR" d
-    f _ b "DEBUG" d | not showAll = doLog (\_ -> return ()) b "DEBUG" d
-    f _ b "INFO" d | not showAll = doLog (\_ -> return ()) b "INFO" d
-    f _ b "DDL" d | not showAll = doLog (\_ -> return ()) b "DDL" d
-    f a b c d = doLog a b c d
+    f :: (String -> IO ()) -> P.LogName -> String -> String -> IO ()
+    f _ b "ERROR" d = P.doLog (\_ -> return ()) b "ERROR" d
+    f _ b "DEBUG" d | not showAll = P.doLog (\_ -> return ()) b "DEBUG" d
+    f _ b "INFO" d | not showAll = P.doLog (\_ -> return ()) b "INFO" d
+    f _ b "DDL" d | not showAll = P.doLog (\_ -> return ()) b "DDL" d
+    f a b c d = P.doLog a b c d
 
 -- | Test Pact Execution Context for running inside 'PactServiceM'.
 -- Only used internally.
-data TestPactCtx tbl = TestPactCtx
+data TestPactCtx logger tbl = TestPactCtx
     { _testPactCtxState :: !(MVar PactServiceState)
-    , _testPactCtxEnv :: !(PactServiceEnv tbl)
+    , _testPactCtxEnv :: !(PactServiceEnv logger tbl)
     }
 
-
-evalPactServiceM_ :: TestPactCtx tbl -> PactServiceM tbl a -> IO a
+evalPactServiceM_ :: TestPactCtx logger tbl -> PactServiceM logger tbl a -> IO a
 evalPactServiceM_ ctx pact = modifyMVar (_testPactCtxState ctx) $ \s -> do
     T2 a s' <- runPactServiceM s (_testPactCtxEnv ctx) pact
     return (s',a)
 
-destroyTestPactCtx :: TestPactCtx tbl -> IO ()
+destroyTestPactCtx :: TestPactCtx logger tbl -> IO ()
 destroyTestPactCtx = void . takeMVar . _testPactCtxState
 
 -- | setup TestPactCtx, internal function.
 -- Use 'withPactCtxSQLite' in tests.
 testPactCtxSQLite
-  :: CanReadablePayloadCas tbl
-  => (String -> IO ())
-    -- ^ logging backend
+  :: forall logger tbl. (Logger logger, CanReadablePayloadCas tbl)
+  => logger
   -> ChainwebVersion
   -> Version.ChainId
   -> BlockHeaderDb
@@ -605,92 +670,94 @@ testPactCtxSQLite
   -> SQLiteEnv
   -> PactServiceConfig
   -> (TxContext -> GasModel)
-  -> IO (TestPactCtx tbl, PactDbEnv')
-testPactCtxSQLite logBackend v cid bhdb pdb sqlenv conf gasmodel = do
-    (dbSt,cpe) <- initRelationalCheckpointer' initialBlockState sqlenv cpLogger v cid
+  -> IO (TestPactCtx logger tbl)
+testPactCtxSQLite logger v cid bhdb pdb sqlenv conf gasmodel = do
+    cp <- initRelationalCheckpointer defaultModuleCacheLimit sqlenv DoNotPersistIntraBlockWrites cpLogger v cid
     let rs = readRewards
-        ph = ParentHeader $ genesisBlockHeader v cid
     !ctx <- TestPactCtx
-      <$!> newMVar (PactServiceState Nothing mempty ph noSPVSupport)
-      <*> pure (pactServiceEnv cpe rs)
-    evalPactServiceM_ ctx (initialPayloadState dummyLogger mempty v cid)
-    return (ctx, PactDbEnv' dbSt)
+      <$!> newMVar (PactServiceState mempty)
+      <*> pure (mkPactServiceEnv cp rs)
+    evalPactServiceM_ ctx (initialPayloadState mempty v cid)
+    return ctx
   where
-    initialBlockState = initBlockState defaultModuleCacheLimit $ genesisHeight v cid
-    loggers = pactTestLogger logBackend False -- toggle verbose pact test logging
-    cpLogger = newLogger loggers $ LogName ("Checkpointer" ++ show cid)
-    pactServiceEnv cpe rs = PactServiceEnv
+    cpLogger = addLabel ("chain-id", chainIdToText cid) $ addLabel ("sub-component", "checkpointer") $ logger
+    mkPactServiceEnv :: Checkpointer logger -> MinerRewards -> PactServiceEnv logger tbl
+    mkPactServiceEnv cp rs = PactServiceEnv
         { _psMempoolAccess = Nothing
-        , _psCheckpointEnv = cpe
+        , _psCheckpointer = cp
         , _psPdb = pdb
         , _psBlockHeaderDb = bhdb
         , _psGasModel = gasmodel
         , _psMinerRewards = rs
         , _psReorgLimit = _pactReorgLimit conf
-        , _psLocalRewindDepthLimit = _pactLocalRewindDepthLimit conf
+        , _psPreInsertCheckTimeout = _pactPreInsertCheckTimeout conf
         , _psOnFatalError = defaultOnFatalError mempty
         , _psVersion = v
-        , _psValidateHashesOnReplay = _pactRevalidate conf
         , _psAllowReadsInLocal = _pactAllowReadsInLocal conf
-        , _psIsBatch = False
-        , _psCheckpointerDepth = 0
-        , _psLogger = newLogger loggers $ LogName ("PactService" ++ show cid)
-        , _psGasLogger = Nothing
-        , _psLoggers = loggers
+        , _psLogger = addLabel ("chain-id", chainIdToText cid) $ addLabel ("component", "pact") $ _cpLogger $ _cpReadCp cp
+        , _psGasLogger = do
+            guard (_pactLogGas conf)
+            return
+                $ addLabel ("chain-id", chainIdToText cid)
+                $ addLabel ("component", "pact")
+                $ addLabel ("sub-component", "gas")
+                $ _cpLogger $ _cpReadCp cp
+
         , _psBlockGasLimit = _pactBlockGasLimit conf
-        , _psChainId = cid
+        , _psEnableLocalTimeout = False
         }
 
 freeGasModel :: TxContext -> GasModel
 freeGasModel = const $ constGasModel 0
 
-
 -- | A queue-less WebPactExecutionService (for all chains)
 -- with direct chain access map for local.
 withWebPactExecutionService
-    :: (String -> IO ())
-        -- ^ logging backend
+    :: (Logger logger)
+    => logger
     -> ChainwebVersion
     -> PactServiceConfig
     -> TestBlockDb
     -> MemPoolAccess
     -> (TxContext -> GasModel)
-    -> ((WebPactExecutionService,HM.HashMap ChainId PactExecutionService) -> IO a)
+    -> ((WebPactExecutionService,HM.HashMap ChainId (SQLiteEnv, PactExecutionService)) -> IO a)
     -> IO a
-withWebPactExecutionService logBackend v pactConfig bdb mempoolAccess gasmodel act =
+withWebPactExecutionService logger v pactConfig bdb mempoolAccess gasmodel act =
   withDbs $ \sqlenvs -> do
     pacts <- fmap HM.fromList
-           $ traverse mkPact
+           $ traverse (\(dbEnv, cid) -> (cid,) . (dbEnv,) <$> mkPact dbEnv cid)
            $ zip sqlenvs
            $ toList
            $ chainIds v
-    act (mkWebPactExecutionService pacts, pacts)
+    act (mkWebPactExecutionService (snd <$> pacts), pacts)
   where
     withDbs f = foldl' (\soFar _ -> withDb soFar) f (chainIds v) []
     withDb g envs = withTempSQLiteConnection chainwebPragmas $ \s -> g (s : envs)
 
-    mkPact (sqlenv, c) = do
+    mkPact :: SQLiteEnv -> ChainId -> IO PactExecutionService
+    mkPact sqlenv c = do
         bhdb <- getBlockHeaderDb c bdb
-        (ctx,_) <- testPactCtxSQLite logBackend v c bhdb (_bdbPayloadDb bdb) sqlenv pactConfig gasmodel
-        return $ (c,) $ PactExecutionService
-          { _pactNewBlock = \m p ->
-              evalPactServiceM_ ctx $ execNewBlock mempoolAccess p m
+        ctx <- testPactCtxSQLite logger v c bhdb (_bdbPayloadDb bdb) sqlenv pactConfig gasmodel
+        return $ PactExecutionService
+          { _pactNewBlock = \_ m ->
+              evalPactServiceM_ ctx $ execNewBlock mempoolAccess m
           , _pactValidateBlock = \h d ->
-              evalPactServiceM_ ctx $ execValidateBlock mempoolAccess h d
+              evalPactServiceM_ ctx $ fst <$> execValidateBlock mempoolAccess h d
           , _pactLocal = \pf sv rd cmd ->
-              evalPactServiceM_ ctx $ Right <$> execLocal cmd pf sv rd
-          , _pactLookup = \rp hashes ->
-              evalPactServiceM_ ctx $ Right <$> execLookupPactTxs rp hashes
+              evalPactServiceM_ ctx $ execLocal cmd pf sv rd
+          , _pactLookup = \_cid cd hashes ->
+              evalPactServiceM_ ctx $ execLookupPactTxs cd hashes
           , _pactPreInsertCheck = \_ txs ->
-              evalPactServiceM_ ctx $ (Right . V.map (() <$)) <$> execPreInsertCheckReq txs
+              evalPactServiceM_ ctx $ V.map (() <$) <$> execPreInsertCheckReq txs
           , _pactBlockTxHistory = \h d ->
-              evalPactServiceM_ ctx $ Right <$> execBlockTxHistory h d
+              evalPactServiceM_ ctx $ execBlockTxHistory h d
           , _pactHistoricalLookup = \h d k ->
-              evalPactServiceM_ ctx $ Right <$> execHistoricalLookup h d k
+              evalPactServiceM_ ctx $ execHistoricalLookup h d k
           , _pactSyncToBlock = \h ->
               evalPactServiceM_ ctx $ execSyncToBlock h
+          , _pactReadOnlyReplay = \l u ->
+              evalPactServiceM_ ctx $ execReadOnlyReplay l u
           }
-
 
 -- | Noncer for 'runCut'
 type Noncer = ChainId -> IO Nonce
@@ -710,58 +777,55 @@ runCut
     -> IO ()
 runCut v bdb pact genTime noncer miner =
   forM_ (chainIds v) $ \cid -> do
-    ph <- ParentHeader <$> getParentTestBlockDb bdb cid
-    pout <- _webPactNewBlock pact miner ph
+    T2 ph pout <- _webPactNewBlock pact cid miner
     n <- noncer cid
-    addTestBlockDb bdb n genTime cid pout
-    h <- getParentTestBlockDb bdb cid
-    void $ _webPactValidateBlock pact h (payloadWithOutputsToPayloadData pout)
+
+    -- skip this chain if mining fails and retry with the next chain.
+    whenM (addTestBlockDb bdb (succ $ _blockHeight $ _parentHeader ph) n genTime cid pout) $ do
+        h <- getParentTestBlockDb bdb cid
+        void $ _webPactValidateBlock pact h (CheckablePayloadWithOutputs pout)
 
 initializeSQLite :: IO SQLiteEnv
 initializeSQLite = open2 file >>= \case
     Left (_err, _msg) ->
         internalError "initializeSQLite: A connection could not be opened."
-    Right r ->  return (SQLiteEnv r (SQLiteConfig file chainwebPragmas))
+    Right r -> return r
   where
     file = "" {- temporary sqlitedb -}
 
 freeSQLiteResource :: SQLiteEnv -> IO ()
-freeSQLiteResource sqlenv = void $ close_v2 $ _sConn sqlenv
+freeSQLiteResource sqlenv = void $ close_v2 sqlenv
 
--- | Run in 'PactServiceM' with direct db access.
-type WithPactCtxSQLite tbl = forall a . (PactDbEnv' -> PactServiceM tbl a) -> IO a
+type WithPactCtxSQLite logger tbl = forall a . PactServiceM logger tbl a -> IO a
 
 -- | Used to run 'PactServiceM' functions directly on a database (ie not use checkpointer).
 withPactCtxSQLite
-  :: CanReadablePayloadCas tbl
-  => ChainwebVersion
+  :: (Logger logger, CanReadablePayloadCas tbl)
+  => logger
+  -> ChainwebVersion
   -> IO BlockHeaderDb
   -> IO (PayloadDb tbl)
   -> PactServiceConfig
-  -> (WithPactCtxSQLite tbl -> TestTree)
+  -> (WithPactCtxSQLite logger tbl -> TestTree)
   -> TestTree
-withPactCtxSQLite v bhdbIO pdbIO conf f =
+withPactCtxSQLite logger v bhdbIO pdbIO conf f =
   withResource
     initializeSQLite
     freeSQLiteResource $ \io ->
       withResource (start io) destroy $ \ctxIO -> f $ \toPact -> do
-          (ctx, dbSt) <- ctxIO
-          evalPactServiceM_ ctx (toPact dbSt)
+          ctx <- ctxIO
+          evalPactServiceM_ ctx toPact
   where
-    destroy = destroyTestPactCtx . fst
+    destroy = destroyTestPactCtx
+    cid = someChainId v
     start ios = do
-        let cid = someChainId v
         bhdb <- bhdbIO
         pdb <- pdbIO
         s <- ios
-        testPactCtxSQLite (\_ -> return ()) v cid bhdb pdb s conf freeGasModel
+        testPactCtxSQLite logger v cid bhdb pdb s conf freeGasModel
 
 toTxCreationTime :: Integral a => Time a -> TxCreationTime
 toTxCreationTime (Time timespan) = TxCreationTime $ fromIntegral $ timeSpanToSeconds timespan
-
-withPayloadDb :: (IO (PayloadDb HashMapTable) -> TestTree) -> TestTree
-withPayloadDb = withResource newPayloadDb mempty
-
 
 -- | 'MemPoolAccess' that delegates all calls to the contents of provided `IORef`.
 delegateMemPoolAccess :: IORef MemPoolAccess -> MemPoolAccess
@@ -782,7 +846,7 @@ delegateMemPoolAccess r = MemPoolAccess
 withDelegateMempool
   :: (IO (IORef MemPoolAccess, MemPoolAccess) -> TestTree)
   -> TestTree
-withDelegateMempool = withResource start mempty
+withDelegateMempool = withResource' start
   where
     start = (id &&& delegateMemPoolAccess) <$> newIORef mempty
 
@@ -799,7 +863,6 @@ setOneShotMempool mpRefIO mp = do
         False -> writeIORef oneShot True >> mpaGetBlock mp g v i a e
         True -> mempty
     }
-
 
 withBlockHeaderDb
     :: IO RocksDb
@@ -818,26 +881,80 @@ withTemporaryDir = withResource
     (getTemporaryDirectory >>= \d -> createTempDirectory d "test-pact")
     removeDirectoryRecursive
 
-withTestBlockDbTest
+-- | Single-chain Pact via service queue.
+--
+--   The difference between this and 'withPactTestBlockDb' is that,
+--   this function takes a `SQLiteEnv` resource which it then exposes
+--   to the test function.
+--
+--   TODO: Consolidate these two functions.
+withPactTestBlockDb'
     :: ChainwebVersion
+    -> ChainId
     -> RocksDb
-    -> (IO TestBlockDb -> TestTree)
+    -> IO SQLiteEnv
+    -> IO MemPoolAccess
+    -> PactServiceConfig
+    -> (IO (SQLiteEnv,PactQueue,TestBlockDb) -> TestTree)
     -> TestTree
-withTestBlockDbTest v rdb = withResource (mkTestBlockDb v rdb) mempty
+withPactTestBlockDb' version cid rdb sqlEnvIO mempoolIO pactConfig f =
+  withResource' (mkTestBlockDb version rdb) $ \bdbio ->
+  withResource (startPact bdbio) stopPact $ f . fmap (view _2)
+  where
+    startPact bdbio = do
+        reqQ <- newPactQueue 2000
+        bdb <- bdbio
+        sqlEnv <- sqlEnvIO
+        mempool <- mempoolIO
+        bhdb <- getWebBlockHeaderDb (_bdbWebBlockHeaderDb bdb) cid
+        let pdb = _bdbPayloadDb bdb
+        a <- async $ runForever (\_ _ -> return ()) "Chainweb.Test.Pact.Utils.withPactTestBlockDb" $
+            runPactService version cid logger reqQ mempool bhdb pdb sqlEnv pactConfig
+        return (a, (sqlEnv,reqQ,bdb))
+
+    stopPact (a, _) = cancel a
+
+    -- Ideally, we should throw 'error' when the logger is invoked, because
+    -- error logs should not happen in production and should always be resolved.
+    -- Unfortunately, that's not yet always the case. So we just drop the
+    -- message.
+    --
+    logger = genericLogger Error (\_ -> return ())
+
+withSqliteDb :: ()
+  => ChainId
+  -> IO FilePath
+  -> (IO SQLiteEnv -> TestTree)
+  -> TestTree
+withSqliteDb cid iodir s = withResource start stop s
+  where
+    start = do
+      dir <- iodir
+      startSqliteDb cid logger dir False
+
+    stop env = do
+      stopSqliteDb env
+
+   -- Ideally, we should throw 'error' when the logger is invoked, because
+    -- error logs should not happen in production and should always be resolved.
+    -- Unfortunately, that's not yet always the case. So we just drop the
+    -- message.
+    --
+    logger = genericLogger Error (\_ -> return ())
 
 -- | Single-chain Pact via service queue.
 withPactTestBlockDb
     :: ChainwebVersion
     -> ChainId
     -> RocksDb
-    -> (IO MemPoolAccess)
+    -> IO MemPoolAccess
     -> PactServiceConfig
-    -> (IO (PactQueue,TestBlockDb) -> TestTree)
+    -> (IO (SQLiteEnv,PactQueue,TestBlockDb) -> TestTree)
     -> TestTree
 withPactTestBlockDb version cid rdb mempoolIO pactConfig f =
   withTemporaryDir $ \iodir ->
-  withTestBlockDbTest version rdb $ \bdbio ->
-  withResource (startPact bdbio iodir) stopPact $ f . fmap (view _3)
+  withResource' (mkTestBlockDb version rdb) $ \bdbio ->
+  withResource (startPact bdbio iodir) stopPact $ f . fmap (view _2)
   where
     startPact bdbio iodir = do
         reqQ <- newPactQueue 2000
@@ -849,9 +966,9 @@ withPactTestBlockDb version cid rdb mempoolIO pactConfig f =
         sqlEnv <- startSqliteDb cid logger dir False
         a <- async $ runForever (\_ _ -> return ()) "Chainweb.Test.Pact.Utils.withPactTestBlockDb" $
             runPactService version cid logger reqQ mempool bhdb pdb sqlEnv pactConfig
-        return (a, sqlEnv, (reqQ,bdb))
+        return (a, (sqlEnv,reqQ,bdb))
 
-    stopPact (a, sqlEnv, _) = cancel a >> stopSqliteDb sqlEnv
+    stopPact (a, (sqlEnv, _, _)) = cancel a >> stopSqliteDb sqlEnv
 
     -- Ideally, we should throw 'error' when the logger is invoked, because
     -- error logs should not happen in production and should always be resolved.
@@ -863,14 +980,14 @@ withPactTestBlockDb version cid rdb mempoolIO pactConfig f =
 dummyLogger :: GenericLogger
 dummyLogger = genericLogger Error (error . T.unpack)
 
+hunitDummyLogger :: (String -> IO ()) -> GenericLogger
+hunitDummyLogger f = genericLogger Error (f . T.unpack)
+
 someTestVersion :: ChainwebVersion
-someTestVersion = fastForkingCpmTestVersion petersonChainGraph
+someTestVersion = instantCpmTestVersion petersonChainGraph
 
 someTestVersionHeader :: BlockHeader
 someTestVersionHeader = someBlockHeader someTestVersion 10
-
-epochCreationTime :: BlockCreationTime
-epochCreationTime = BlockCreationTime epoch
 
 -- | The runtime is linear in the requested height. This can be slow if a large
 -- block height is requested for a chainweb version that simulates realtime
@@ -884,5 +1001,93 @@ someBlockHeader v h = (!! (int h - 1))
     $ ParentHeader
     $ genesisBlockHeader v (unsafeChainId 0)
 
-makeLenses ''CmdBuilder
-makeLenses ''CmdSigner
+-- | Get all pact user tables.
+--
+--   Note: This consumes a stream. If you are writing a test
+--   with very large pact states (think: Gigabytes), use
+--   the streaming version of this function from
+--   'Chainweb.Pact.Backend.PactState'.
+getPactUserTables :: Database -> IO (Map Text [PactRow])
+getPactUserTables db = do
+  S.foldM_
+    (\m tbl -> pure (M.insert tbl.name tbl.rows m))
+    (pure M.empty)
+    pure
+    (PactState.getPactTables db)
+
+-- | Get active/latest pact state.
+--
+--   Note: This consumes a stream. If you are writing a test
+--   with very large pact states (think: Gigabytes), use
+--   the streaming version of this function from
+--   'Chainweb.Pact.Backend.PactState'.
+getLatestPactState :: Database -> IO (Map Text (Map ByteString ByteString))
+getLatestPactState db = do
+  S.foldM_
+    (\m td -> pure (M.insert td.name td.rows m))
+    (pure M.empty)
+    pure
+    (PactState.getLatestPactStateDiffable db)
+
+locateTarget :: ()
+  => SQLiteEnv
+  -> C.TargetBlockHeight
+  -> IO BlockHeight
+locateTarget db = \case
+  C.Target height -> do
+    PactState.ensureBlockHeightExists db height
+    pure height
+  C.LatestUnsafe -> do
+    PactState.getLatestBlockHeight db
+  C.LatestSafe -> do
+    latest <- PactState.getLatestBlockHeight db
+    earliest <- PactState.getEarliestBlockHeight db
+
+    let safeDepth = 1_000
+
+    when (latest - earliest < safeDepth) $ do
+      error "not enough history for Compaction.LatestSafe"
+
+    pure (latest - safeDepth)
+
+-- | Compaction utility for testing.
+--   Most of the time the flags will be ['C.NoVacuum']
+compact :: ()
+  => LogLevel
+  -> [C.CompactFlag]
+  -> SQLiteEnv
+  -> C.TargetBlockHeight
+  -> IO ()
+compact logLevel cFlags db target = do
+  C.withDefaultLogger logLevel $ \logger -> do
+    height <- locateTarget db target
+    void $ C.compact height logger db cFlags
+
+-- | Compaction function that retries until the database is available.
+compactUntilAvailable
+  :: C.TargetBlockHeight
+  -> YAL.Logger SomeLogMessage
+  -> SQLiteEnv
+  -> [C.CompactFlag]
+  -> IO ()
+compactUntilAvailable target logger db flags = do
+  height <- locateTarget db target
+  go height
+  where
+    go h = do
+      r <- try (C.compact h logger db flags)
+      case r of
+        Right _ -> pure ()
+        Left err
+          | C.CompactExceptionDb e <- err
+          , Just ioErr <- fromException e
+            -- someone, somewhere, is calling "show" on an exception
+          , "ErrorBusy" `List.isInfixOf` ioe_description ioErr
+          -> putStrLn "Retrying compaction" >> go h
+          | otherwise -> throwM err
+
+getPWOByHeader :: BlockHeader -> TestBlockDb -> IO PayloadWithOutputs
+getPWOByHeader h (TestBlockDb _ pdb _) =
+  lookupPayloadWithHeight pdb (Just $ _blockHeight h) (_blockPayloadHash h) >>= \case
+    Nothing -> throwM $ userError "getPWOByHeader: payload not found"
+    Just pwo -> return pwo

@@ -1,6 +1,7 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
@@ -19,7 +20,6 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE TypeInType #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
 
@@ -89,6 +89,7 @@ module Chainweb.BlockHeader
 , decodeBlockHeaderWithoutHash
 , decodeBlockHeaderChecked
 , decodeBlockHeaderCheckedChainId
+, blockHeaderShortDescription
 , ObjectEncoded(..)
 
 , timeBetween
@@ -179,9 +180,6 @@ import Text.Read (readEither)
 -- -------------------------------------------------------------------------- --
 -- Nonce
 
--- | FIXME: is 64 bit enough for the nonce. It seems that it may not be
--- sufficient for the current hashpower of the bitcoin network.
---
 newtype Nonce = Nonce Word64
     deriving stock (Show, Eq, Ord, Generic)
     deriving anyclass (NFData)
@@ -389,6 +387,18 @@ instance IsCasValue BlockHeader where
 
 type BlockHeaderCas tbl = Cas tbl BlockHeader
 
+-- | Used for quickly identifying "which block" this is.
+-- Example output:
+-- "0 @ bSQgL5 (height 4810062)"
+blockHeaderShortDescription :: BlockHeader -> T.Text
+blockHeaderShortDescription bh =
+    T.unwords
+        [ toText (_chainId bh)
+        , "@"
+        , blockHashToTextShort (_blockHash bh)
+        , "(height " <> sshow (getBlockHeight $ _blockHeight bh) <> ")"
+        ]
+
 makeLenses ''BlockHeader
 
 -- | During the first epoch after genesis there are 10 extra difficulty
@@ -424,11 +434,11 @@ slowEpoch (ParentHeader p) (BlockCreationTime ct) = actual > (expected * 5)
   where
     EpochStartTime es = _blockEpochStart p
     v = _chainwebVersion p
-    BlockRate br = _versionBlockRate v
+    BlockDelay bd = _versionBlockDelay v
     WindowWidth ww = _versionWindow v
 
     expected :: Micros
-    expected = br * int ww
+    expected = bd * int ww
 
     actual :: Micros
     actual = timeSpanToMicros $ ct .-. es
@@ -470,12 +480,12 @@ powTarget p@(ParentHeader ph) as bct = case effectiveWindow ph of
 
     activeAdjust w
         | oldDaGuard ver (_chainId ph) (_blockHeight ph + 1)
-            = legacyAdjust (_versionBlockRate ver) w (t .-. _blockEpochStart ph) (_blockTarget ph)
+            = legacyAdjust (_versionBlockDelay ver) w (t .-. _blockEpochStart ph) (_blockTarget ph)
         | otherwise
             = avgTarget $ adjustForParent w <$> (p : HM.elems as)
 
     adjustForParent w (ParentHeader a)
-        = adjust (_versionBlockRate ver) w (toEpochStart a .-. _blockEpochStart a) (_blockTarget a)
+        = adjust (_versionBlockDelay ver) w (toEpochStart a .-. _blockEpochStart a) (_blockTarget a)
 
     toEpochStart = EpochStartTime . _bct . _blockCreationTime
 
@@ -949,6 +959,7 @@ blockAdjacentChainIds = to _blockAdjacentChainIds
 getAdjacentHash :: MonadThrow m => HasChainId p => p -> BlockHeader -> m BlockHash
 getAdjacentHash p b = firstOf (blockAdjacentHashes . ixg (_chainId p)) b
     ??? ChainNotAdjacentException
+        (_chainId b)
         (Expected $ _chainId p)
         (Actual $ _blockAdjacentChainIds b)
 {-# INLINE getAdjacentHash #-}
@@ -996,7 +1007,7 @@ newtype ObjectEncoded a = ObjectEncoded { _objectEncoded :: a }
     deriving newtype (Eq, Ord, Hashable, NFData)
 
 blockHeaderProperties
-    :: KeyValue kv
+    :: KeyValue e kv
     => ObjectEncoded BlockHeader
     -> [kv]
 blockHeaderProperties (ObjectEncoded b) =

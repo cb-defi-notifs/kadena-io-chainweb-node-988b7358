@@ -1,7 +1,13 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TypeOperators #-}
+
 module Chainweb.Pact.Backend.Bench
   ( bench )
   where
@@ -12,22 +18,27 @@ import Control.Monad
 import Control.Monad.Catch
 import qualified Criterion.Main as C
 
+import qualified Data.Vector as V
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.Map.Strict as M
 
+import System.LogLevel
 import System.Random
+
+import qualified Streaming.Prelude as Stream
 
 -- pact imports
 
 import Pact.Interpreter (PactDbEnv(..), mkPactDbEnv)
 import Pact.PersistPactDb (DbEnv(..), initDbEnv, pactdb)
 import Pact.Types.Exp
-import Pact.Types.Logger
+import qualified Pact.Types.Logger as P
 import Pact.Types.Persistence
 import Pact.Types.RowData
 import Pact.Types.Term
 import Pact.Types.Util
+import qualified Pact.Types.Hash as Pact
 import qualified Pact.Interpreter as PI
 import qualified Pact.Persist.SQLite as PSQL
 import qualified Pact.Types.SQLite as PSQL
@@ -36,20 +47,43 @@ import qualified Pact.Types.SQLite as PSQL
 
 import Chainweb.BlockHash
 import Chainweb.BlockHeader
-import Chainweb.BlockHeight
 import Chainweb.Graph
+import Chainweb.Logger
 import Chainweb.MerkleLogHash
 import Chainweb.Pact.Backend.RelationalCheckpointer
 import Chainweb.Pact.Backend.Types
 import Chainweb.Pact.Backend.Utils
+import Chainweb.Pact.Service.Types
 import Chainweb.Pact.Types
 import Chainweb.Test.TestVersions
 import Chainweb.Utils.Bench
 import Chainweb.Utils (sshow)
 import Chainweb.Version
 
-v :: ChainwebVersion
-v = fastForkingCpmTestVersion petersonChainGraph
+testVer :: ChainwebVersion
+testVer = instantCpmTestVersion petersonChainGraph
+
+testChainId :: ChainId
+testChainId = unsafeChainId 0
+
+-- allowing a straightforward list of blocks to be passed to the API,
+-- and only exposing the PactDbEnv part of the block context
+cpRestoreAndSave
+  :: (Monoid q)
+  => Checkpointer logger
+  -> Maybe BlockHeader
+  -> [(BlockHeader, ChainwebPactDbEnv logger -> IO q)]
+  -> IO q
+cpRestoreAndSave cp pc blks = snd <$> _cpRestoreAndSave cp (ParentHeader <$> pc)
+  (traverse Stream.yield [RunnableBlock $ \dbEnv _ -> (,bh) <$> fun (_cpPactDbEnv dbEnv) | (bh, fun) <- blks])
+
+-- | fabricate a `BlockHeader` for a block given its hash and its parent.
+childOf :: Maybe BlockHeader -> BlockHash -> BlockHeader
+childOf (Just bh) bhsh =
+  bh { _blockHash = bhsh, _blockParent = _blockHash bh, _blockHeight = _blockHeight bh + 1 }
+childOf Nothing bhsh =
+  (genesisBlockHeader testVer testChainId) { _blockHash = bhsh }
+
 
 bench :: C.Benchmark
 bench = C.bgroup "pact-backend" $
@@ -60,6 +94,7 @@ bench = C.bgroup "pact-backend" $
              , cpWithBench . cpBenchNoRewindOverBlock
              , cpWithBench . cpBenchOverBlock
              , cpWithBench . cpBenchSampleKeys
+             , cpWithBench . cpBenchLookupProcessedTx
              -- , cpWithBench . cpBenchKeys
              ]
   where
@@ -83,8 +118,8 @@ pactSqliteWithBench unsafe benchtorun =
     prags = if unsafe then PSQL.fastNoJournalPragmas else chainwebPragmas
     setup = do
         let dbFile = "" {- temporary sqlite db -}
-        !sqliteEnv <- PSQL.initSQLite (PSQL.SQLiteConfig dbFile  prags) neverLog
-        dbe <- mkPactDbEnv pactdb (initDbEnv neverLog PSQL.persister sqliteEnv)
+        !sqliteEnv <- PSQL.initSQLite (PSQL.SQLiteConfig dbFile  prags) P.neverLog
+        dbe <- mkPactDbEnv pactdb (initDbEnv P.neverLog PSQL.persister sqliteEnv)
         PI.initSchema dbe
         return $ NoopNFData dbe
 
@@ -98,45 +133,41 @@ pactSqliteWithBench unsafe benchtorun =
           benchtorun dbEnv
         ]
 
-cpWithBench :: (CheckpointEnv -> C.Benchmark) -> C.Benchmark
+cpWithBench :: forall logger. (Logger logger, logger ~ GenericLogger)
+  => (Checkpointer logger -> C.Benchmark)
+  -> C.Benchmark
 cpWithBench torun =
     C.envWithCleanup setup teardown $ \ ~(NoopNFData (_,e)) ->
         C.bgroup name (benches e)
   where
     name = "batchedCheckpointer"
-    cid = unsafeChainId 0
-
-    initialBlockState = initBlockState defaultModuleCacheLimit $ genesisHeight v cid
 
     setup = do
         let dbFile = "" {- temporary SQLite db -}
+        let neverLogger = genericLogger Error (\_ -> return ())
         !sqliteEnv <- openSQLiteConnection dbFile chainwebPragmas
-        let nolog = newLogger neverLog ""
         !cenv <-
-          initRelationalCheckpointer initialBlockState sqliteEnv nolog v cid
+          initRelationalCheckpointer defaultModuleCacheLimit sqliteEnv DoNotPersistIntraBlockWrites neverLogger testVer testChainId
         return $ NoopNFData (sqliteEnv, cenv)
 
     teardown (NoopNFData (sqliteEnv, _cenv)) = closeSQLiteConnection sqliteEnv
 
-    benches :: CheckpointEnv -> [C.Benchmark]
+    benches :: Checkpointer logger -> [C.Benchmark]
     benches cpenv =
-        [
-          torun cpenv
-        ]
+        [ torun cpenv ]
 
-cpBenchNoRewindOverBlock :: Int -> CheckpointEnv -> C.Benchmark
-cpBenchNoRewindOverBlock transactionCount cp = C.env (setup' cp) $ \ ~(ut) ->
+cpBenchNoRewindOverBlock :: Int -> Checkpointer logger -> C.Benchmark
+cpBenchNoRewindOverBlock transactionCount cp = C.env setup' $ \ ~ut ->
   C.bench name $ C.nfIO $ do
-      mv <- newMVar (BlockHeight 1, initbytestring, hash01)
-      go cp mv ut
+      mv <- newMVar (initbytestring, pc01)
+      go mv ut
   where
     name = "noRewind/transactionCount="
       ++ show transactionCount
-    setup' CheckpointEnv{..} = do
-        usertablename <- _cpRestore _cpeCheckpointer Nothing >>= \case
-          PactDbEnv' db ->
-            setupUserTable db $ \ut -> writeRow db Insert ut f k 1
-        _cpSave _cpeCheckpointer hash01
+    pc01 = childOf Nothing hash01
+    setup' = do
+        [usertablename] <- cpRestoreAndSave cp Nothing
+          [(pc01, \db -> fmap (:[]) $ setupUserTable db $ \ut -> writeRow db Insert ut f k 1)]
         return usertablename
 
     f = "f"
@@ -154,29 +185,28 @@ cpBenchNoRewindOverBlock transactionCount cp = C.env (setup' cp) $ \ ~(ut) ->
       where
         inc = B8.replicate 30 '\NUL' <> "\SOH\NUL"
 
-    go CheckpointEnv{..} mblock (NoopNFData ut) = do
-        (blockheight, bytestring, hash) <- readMVar mblock
-        void $ _cpRestore _cpeCheckpointer (Just (blockheight, hash)) >>= \case
-          PactDbEnv' pactdbenv ->
-            replicateM_ transactionCount (transaction pactdbenv)
+    go mblock (NoopNFData ut) = do
+        (bytestring, pc) <- readMVar mblock
         let (bytestring', hash') = nextHash bytestring
+        let pc' = childOf (Just pc) hash'
         modifyMVar_ mblock
-            (const $  return (blockheight + 1, bytestring', hash'))
-        void $ _cpSave _cpeCheckpointer hash'
+            $ \_ -> do
+              return (bytestring', pc')
+        void $ cpRestoreAndSave cp (Just pc)
+            [(pc', \pactdbenv -> replicateM_ transactionCount (transaction pactdbenv))]
 
       where
         transaction db = incIntegerAtKey db ut f k 1
 
-cpBenchOverBlock :: Int -> CheckpointEnv -> C.Benchmark
-cpBenchOverBlock transactionCount cp = C.env (setup' cp) $ \ ~(ut) ->
-    C.bench benchname $ C.nfIO (go cp ut)
+cpBenchOverBlock :: Int -> Checkpointer logger -> C.Benchmark
+cpBenchOverBlock transactionCount cp = C.env setup' $ \ ~(ut) ->
+    C.bench benchname $ C.nfIO (go ut)
   where
     benchname = "overBlock/transactionCount=" ++ show transactionCount
-    setup' CheckpointEnv{..} = do
-        usertablename <- _cpRestore _cpeCheckpointer Nothing >>= \case
-            PactDbEnv' db ->
-              setupUserTable db $ \ut -> writeRow db Insert ut f k 1
-        _cpSave _cpeCheckpointer hash01
+    setup' = do
+        [usertablename] <- cpRestoreAndSave cp Nothing [(pc01, \db ->
+            fmap (:[]) $ setupUserTable db $ \ut -> writeRow db Insert ut f k 1
+            )]
         return usertablename
 
     f = "f"
@@ -184,12 +214,14 @@ cpBenchOverBlock transactionCount cp = C.env (setup' cp) $ \ ~(ut) ->
 
     hash01 = BlockHash $ unsafeMerkleLogHash "0000000000000000000000000000001a"
     hash02 = BlockHash $ unsafeMerkleLogHash "0000000000000000000000000000002a"
+    pc01 = childOf Nothing hash01
+    pc02 = childOf (Just pc01) hash02
 
-    go CheckpointEnv{..} (NoopNFData ut) = do
-        _cpRestore _cpeCheckpointer (Just (BlockHeight 1, hash01)) >>= \case
-            PactDbEnv' pactdbenv ->
-              replicateM_ transactionCount (transaction pactdbenv)
-        void $ _cpSave _cpeCheckpointer hash02
+    go (NoopNFData ut) = do
+        cpRestoreAndSave cp (Just pc01)
+            [(pc02, \pactdbenv ->
+                replicateM_ transactionCount (transaction pactdbenv)
+            )]
       where
         transaction db = incIntegerAtKey db ut f k 1
 
@@ -300,51 +332,54 @@ benchUserTableForKeys numSampleEvents dbEnv =
           writeRow db Update ut f rowkeyb a
 
 
-_cpBenchKeys :: Int -> CheckpointEnv -> C.Benchmark
+_cpBenchKeys :: Int -> Checkpointer logger -> C.Benchmark
 _cpBenchKeys numKeys cp =
-    C.env (setup' cp) $ \ ~(ut) -> C.bench name $ C.nfIO (go cp ut)
+    C.env setup' $ \ ~(ut) -> C.bench name $ C.nfIO (go ut)
   where
     name = "withKeys/keyCount="
       ++ show numKeys
-    setup' CheckpointEnv{..} = do
-        usertablename <- _cpRestore _cpeCheckpointer Nothing >>= \case
-            PactDbEnv' db ->
-              setupUserTable db $ \ut -> forM_ [1 .. numKeys] $ \i -> do
-                  let rowkey = RowKey $ "k" <> sshow i
-                  writeRow db Insert ut f rowkey (fromIntegral i)
+    setup' = do
+        [usertablename] <- cpRestoreAndSave cp Nothing
+            [(pc01, \db ->
+                fmap (:[]) $ setupUserTable db $ \ut -> forM_ [1 .. numKeys] $ \i -> do
+                    let rowkey = RowKey $ "k" <> sshow i
+                    writeRow db Insert ut f rowkey (fromIntegral i)
+            )]
 
-        _cpSave _cpeCheckpointer hash01
         return usertablename
 
     f = "f"
 
     hash01 = BlockHash $ unsafeMerkleLogHash "0000000000000000000000000000001a"
     hash02 = BlockHash $ unsafeMerkleLogHash "0000000000000000000000000000002a"
+    pc01 = childOf Nothing hash01
+    pc02 = childOf (Just pc01) hash02
 
-    go CheckpointEnv{..} (NoopNFData ut) = do
-        _cpRestore _cpeCheckpointer (Just (BlockHeight 1, hash01)) >>= \case
-            PactDbEnv' pactdbenv -> forM_ [1 .. numKeys] (transaction pactdbenv)
-        void $ _cpSave _cpeCheckpointer hash02
+    go (NoopNFData ut) = do
+        cpRestoreAndSave cp (Just pc01)
+            [(pc02, \pactdbenv ->
+                forM_ [1 .. numKeys] (transaction pactdbenv)
+            )]
       where
         transaction db numkey = do
             let rowkey = RowKey $ "k" <> sshow numkey
             incIntegerAtKey db ut f rowkey 1
 
-cpBenchSampleKeys :: Int -> CheckpointEnv -> C.Benchmark
+cpBenchSampleKeys :: Int -> Checkpointer logger -> C.Benchmark
 cpBenchSampleKeys numSampleEvents cp =
-    C.env (setup' cp) $ \ ~(ut) -> C.bench name $ C.nfIO (go cp ut)
+    C.env setup' $ \ ~(ut) -> C.bench name $ C.nfIO (go ut)
   where
     name = "user-table-keys/sampleEvents=" ++ show numSampleEvents
     numberOfKeys :: Integer
     numberOfKeys = 10
-    setup' CheckpointEnv {..} = do
-        usertablename <- _cpRestore _cpeCheckpointer Nothing >>= \case
-            PactDbEnv' db ->
-              setupUserTable db $ \ut -> forM_ [1 .. numberOfKeys] $ \i -> do
-                  let rowkey = RowKey $ "k" <> sshow i
-                  writeRow db Insert ut f rowkey i
+    setup' = do
+        [usertablename] <- cpRestoreAndSave cp Nothing
+            [(pc01, \db ->
+                fmap (:[]) $ setupUserTable db $ \ut -> forM_ [1 .. numberOfKeys] $ \i -> do
+                    let rowkey = RowKey $ "k" <> sshow i
+                    writeRow db Insert ut f rowkey i
+            )]
 
-        _cpSave _cpeCheckpointer hash01
         return usertablename
 
     unpack = \case
@@ -357,18 +392,52 @@ cpBenchSampleKeys numSampleEvents cp =
 
     hash01 = BlockHash $ unsafeMerkleLogHash "0000000000000000000000000000001a"
     hash02 = BlockHash $ unsafeMerkleLogHash "0000000000000000000000000000002a"
+    pc01 = childOf Nothing hash01
+    pc02 = childOf (Just pc01) hash02
 
     f = "f"
 
-    go CheckpointEnv {..} (NoopNFData ut) = do
-        _cpRestore _cpeCheckpointer (Just (BlockHeight 1, hash01)) >>= \case
-              PactDbEnv' db@(PactDbEnv pdb e) ->
-                forM_ [1 .. numSampleEvents] $ \_ -> do
-                    let torowkey ind = RowKey $ "k" <> sshow ind
-                    rowkeya <- torowkey <$> randomRIO (1,numberOfKeys)
-                    rowkeyb <- torowkey <$> randomRIO (1,numberOfKeys)
-                    a <- _readRow pdb ut rowkeya e >>= unpack
-                    b <- _readRow pdb ut rowkeyb e >>= unpack
-                    writeRow db Update ut f rowkeya b
-                    writeRow db Update ut f rowkeyb a
-        void $ _cpSave _cpeCheckpointer hash02
+    go (NoopNFData ut) = do
+        cpRestoreAndSave cp (Just pc01)
+          [(pc02, \db@(PactDbEnv pdb e) ->
+              forM_ [1 .. numSampleEvents] $ \_ -> do
+                  let torowkey ind = RowKey $ "k" <> sshow ind
+                  rowkeya <- torowkey <$> randomRIO (1,numberOfKeys)
+                  rowkeyb <- torowkey <$> randomRIO (1,numberOfKeys)
+                  a <- _readRow pdb ut rowkeya e >>= unpack
+                  b <- _readRow pdb ut rowkeyb e >>= unpack
+                  writeRow db Update ut f rowkeya b
+                  writeRow db Update ut f rowkeyb a
+          )]
+
+
+cpBenchLookupProcessedTx :: Int -> Checkpointer logger -> C.Benchmark
+cpBenchLookupProcessedTx transactionCount cp = C.env setup' $ \ ~(ut) ->
+    C.bench benchname $ C.nfIO (go ut)
+  where
+    benchname = "lookupProcessedTx/transactionCount=" ++ show transactionCount
+    transaction (NoopNFData ut) db = incIntegerAtKey db ut f k 1
+    setup' = do
+        [usertablename] <- cpRestoreAndSave cp Nothing
+          [(pc01, \db ->
+              fmap (:[]) $ setupUserTable db $ \ut -> writeRow db Insert ut f k 1
+          )]
+
+        cpRestoreAndSave cp (Just pc01)
+          [(pc02, \pactdbenv ->
+              replicateM_ transactionCount (transaction usertablename pactdbenv)
+          )]
+
+        return usertablename
+
+    f = "f"
+    k = "k"
+
+    hash01 = BlockHash $ unsafeMerkleLogHash "0000000000000000000000000000001a"
+    hash02 = BlockHash $ unsafeMerkleLogHash "0000000000000000000000000000002a"
+    pc01 = childOf Nothing hash01
+    pc02 = childOf (Just pc01) hash02
+
+    go (NoopNFData _) = do
+        _cpReadFrom (_cpReadCp cp) (Just (ParentHeader pc02)) $ \dbEnv ->
+          _cpLookupProcessedTx dbEnv (V.fromList [Pact.TypedHash "" | _ <- [1..transactionCount]])

@@ -1,3 +1,4 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeApplications #-}
 -- |
@@ -22,8 +23,11 @@ module Chainweb.Pact.Validations
 , assertNetworkId
 , assertSigSize
 , assertTxSize
+, IsWebAuthnPrefixLegal(..)
 , assertValidateSigs
 , assertTxTimeRelativeToParent
+, assertTxNotInFuture
+, assertCommand
   -- * Defaults
 , defaultMaxCommandUserSigListSize
 , defaultMaxCoinDecimalPlaces
@@ -34,9 +38,12 @@ module Chainweb.Pact.Validations
 import Control.Lens
 
 import Data.Decimal (decimalPlaces)
-import Data.Maybe (isJust, catMaybes)
+import Data.Maybe (isJust, catMaybes, fromMaybe)
+import Data.Either (isRight)
 import Data.List.NonEmpty (NonEmpty, nonEmpty)
 import Data.Text (Text)
+import qualified Data.Text as T
+import qualified Data.ByteString.Short as SBS
 import Data.Word (Word8)
 
 -- internal modules
@@ -47,14 +54,16 @@ import Chainweb.Pact.Types
 import Chainweb.Pact.Utils (fromPactChainId)
 import Chainweb.Pact.Service.Types
 import Chainweb.Time (Seconds(..), Time(..), secondsToTimeSpan, scaleTimeSpan, second, add)
-import Chainweb.Transaction (cmdTimeToLive, cmdCreationTime)
+import Chainweb.Transaction (cmdTimeToLive, cmdCreationTime, PayloadWithText, payloadBytes, payloadObj, IsWebAuthnPrefixLegal(..))
 import Chainweb.Version
+import Chainweb.Version.Guards (isWebAuthnPrefixLegal, validPPKSchemes)
 
 import qualified Pact.Types.Gas as P
 import qualified Pact.Types.Hash as P
 import qualified Pact.Types.ChainId as P
 import qualified Pact.Types.Command as P
 import qualified Pact.Types.ChainMeta as P
+import qualified Pact.Types.KeySet as P
 import qualified Pact.Parse as P
 
 
@@ -64,11 +73,15 @@ assertLocalMetadata
     :: P.Command (P.Payload P.PublicMeta c)
     -> TxContext
     -> Maybe LocalSignatureVerification
-    -> PactServiceM tbl (Either (NonEmpty Text) ())
+    -> PactServiceM logger tbl (Either (NonEmpty Text) ())
 assertLocalMetadata cmd@(P.Command pay sigs hsh) txCtx sigVerify = do
     v <- view psVersion
-    cid <- view psChainId
+    cid <- view chainId
     bgl <- view psBlockGasLimit
+
+    let bh = ctxCurrentBlockHeight txCtx
+    let validSchemes = validPPKSchemes v cid bh
+    let webAuthnPrefixLegal = isWebAuthnPrefixLegal v cid bh
 
     let P.PublicMeta pcid _ gl gp _ _ = P._pMeta pay
         nid = P._pNetworkId pay
@@ -81,7 +94,7 @@ assertLocalMetadata cmd@(P.Command pay sigs hsh) txCtx sigVerify = do
           , eUnless "Gas price decimal precision too high" $ assertGasPrice gp
           , eUnless "Network id mismatch" $ assertNetworkId v nid
           , eUnless "Signature list size too big" $ assertSigSize sigs
-          , eUnless "Invalid transaction signatures" $ sigValidate signers
+          , eUnless "Invalid transaction signatures" $ sigValidate validSchemes webAuthnPrefixLegal signers
           , eUnless "Tx time outside of valid range" $ assertTxTimeRelativeToParent pct cmd
           ]
 
@@ -89,9 +102,9 @@ assertLocalMetadata cmd@(P.Command pay sigs hsh) txCtx sigVerify = do
       Nothing -> Right ()
       Just vs -> Left vs
   where
-    sigValidate signers
+    sigValidate validSchemes webAuthnPrefixLegal signers
       | Just NoVerify <- sigVerify = True
-      | otherwise = assertValidateSigs hsh signers sigs
+      | otherwise = assertValidateSigs validSchemes webAuthnPrefixLegal hsh signers sigs
 
     pct = ParentCreationTime
       . _blockCreationTime
@@ -150,10 +163,19 @@ assertTxSize initialGas gasLimit = initialGas < fromIntegral gasLimit
 -- | Check and assert that signers and user signatures are valid for a given
 -- transaction hash.
 --
-assertValidateSigs :: P.PactHash -> [P.Signer] -> [P.UserSig] -> Bool
-assertValidateSigs hsh signers sigs
+assertValidateSigs :: [P.PPKScheme] -> IsWebAuthnPrefixLegal -> P.PactHash -> [P.Signer] -> [P.UserSig] -> Bool
+assertValidateSigs validSchemes webAuthnPrefixLegal hsh signers sigs
     | length signers /= length sigs = False
-    | otherwise = all (uncurry (P.verifyUserSig hsh)) (zip sigs signers)
+    | otherwise = and $ zipWith verifyUserSig sigs signers
+    where verifyUserSig sig signer =
+            let
+              sigScheme = fromMaybe P.ED25519 (P._siScheme signer)
+              okScheme = sigScheme `elem` validSchemes
+              okPrefix =
+                webAuthnPrefixLegal == WebAuthnPrefixLegal ||
+                not (P.webAuthnPrefix `T.isPrefixOf` P._siPubKey signer)
+              okSignature = isRight $ P.verifyUserSig hsh sig signer
+            in okScheme && okPrefix && okSignature
 
 -- prop_tx_ttl_newBlock/validateBlock
 --
@@ -170,14 +192,37 @@ assertTxTimeRelativeToParent (ParentCreationTime (BlockCreationTime txValidation
     ttl > 0
     && txValidationTime >= timeFromSeconds 0
     && txOriginationTime >= 0
-    && timeFromSeconds txOriginationTime <= lenientTxValidationTime
     && timeFromSeconds (txOriginationTime + ttl) > txValidationTime
-    && ttl <= defaultMaxTTL
+    && P.TTLSeconds ttl <= defaultMaxTTL
   where
     P.TTLSeconds ttl = view cmdTimeToLive tx
     timeFromSeconds = Time . secondsToTimeSpan . Seconds . fromIntegral
     P.TxCreationTime txOriginationTime = view cmdCreationTime tx
+
+-- | Check that the tx's creation time is not too far in the future relative
+-- to the block creation time
+assertTxNotInFuture
+    :: ParentCreationTime
+    -> P.Command (P.Payload P.PublicMeta c)
+    -> Bool
+assertTxNotInFuture (ParentCreationTime (BlockCreationTime txValidationTime)) tx =
+    timeFromSeconds txOriginationTime <= lenientTxValidationTime
+  where
+    timeFromSeconds = Time . secondsToTimeSpan . Seconds . fromIntegral
+    P.TxCreationTime txOriginationTime = view cmdCreationTime tx
     lenientTxValidationTime = add (scaleTimeSpan defaultLenientTimeSlop second) txValidationTime
+
+
+-- | Assert that the command hash matches its payload and
+-- its signatures are valid, without parsing the payload.
+assertCommand :: P.Command PayloadWithText -> [P.PPKScheme] -> IsWebAuthnPrefixLegal -> Bool
+assertCommand (P.Command pwt sigs hsh) ppkSchemePassList webAuthnPrefixLegal =
+  isRight assertHash &&
+  assertValidateSigs ppkSchemePassList webAuthnPrefixLegal hsh signers sigs
+  where
+    cmdBS = SBS.fromShort $ payloadBytes pwt
+    signers = P._pSigners (payloadObj pwt)
+    assertHash = P.verifyHash @'P.Blake2b_256 hsh cmdBS
 
 -- -------------------------------------------------------------------- --
 -- defaults
@@ -199,8 +244,8 @@ defaultMaxCoinDecimalPlaces = 12
 --
 -- This is probably going to be changed. Let us make it 2 days for now.
 --
-defaultMaxTTL :: P.ParsedInteger
-defaultMaxTTL = P.ParsedInteger $ 2 * 24 * 60 * 60
+defaultMaxTTL :: P.TTLSeconds
+defaultMaxTTL = P.TTLSeconds $ P.ParsedInteger $ 2 * 24 * 60 * 60
 
 -- | Validation "slop" to allow for a more lenient creation time check after
 -- @useLegacyCreationTimeForTxValidation@ is no longer true.

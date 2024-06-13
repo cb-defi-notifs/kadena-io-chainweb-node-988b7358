@@ -35,7 +35,7 @@ module Chainweb.Version.Utils
 , someChainIdAt
 , blockCountAt
 , globalBlockCountAt
-, globalBlockRateAt
+, globalBlockDelayAt
 , isGraphChange
 
 -- * Chain Graph Properties By Cut Height
@@ -55,6 +55,9 @@ module Chainweb.Version.Utils
 , expectedCutHeightAfterSeconds
 , expectedBlockCountAfterSeconds
 , expectedGlobalBlockCountAfterSeconds
+
+-- * Verifiers
+, verifiersAt
 ) where
 
 import Chainweb.BlockHeight
@@ -62,9 +65,15 @@ import Chainweb.BlockHeader
 import Chainweb.ChainId
 import Chainweb.Difficulty
 import Chainweb.Time
+import Chainweb.VerifierPlugin
+import qualified Chainweb.VerifierPlugin.Allow
+import qualified Chainweb.VerifierPlugin.Hyperlane.Announcement
+import qualified Chainweb.VerifierPlugin.Hyperlane.Message
 
+import Control.Lens
 import Data.Foldable
 import qualified Data.HashSet as HS
+import Data.Map.Strict(Map)
 import qualified Data.Map.Strict as M
 
 import GHC.Stack
@@ -80,6 +89,8 @@ import Chainweb.Utils
 import Chainweb.Utils.Rule
 import Chainweb.Version
 import Chainweb.Version.Mainnet
+
+import Pact.Types.Verifier
 
 -- -------------------------------------------------------------------------- --
 --  Utils
@@ -223,9 +234,8 @@ someChainId v = someChainIdAt v maxBound
 -- chain ids for the chainweb at the given height.
 --
 someChainIdAt :: HasCallStack => HasChainwebVersion v => v -> BlockHeight -> ChainId
-someChainIdAt v h = head . toList $ chainIdsAt v h
-    -- 'head' is guaranteed to succeed because the empty graph isn't a valid chain
-    -- graph.
+someChainIdAt v h = minimum $ chainIdsAt v h
+    -- guaranteed to succeed because the empty graph isn't a valid chain graph.
 {-# INLINE someChainIdAt #-}
 
 isGraphChange :: HasChainwebVersion v => v -> BlockHeight -> Bool
@@ -266,15 +276,15 @@ globalBlockCountAt v h = sum
     $ toList
     $ chainIdsAt v h
 
-globalBlockRateAt
+globalBlockDelayAt
     :: HasCallStack
     => HasChainwebVersion v
     => v
     -> BlockHeight
     -> Double
-globalBlockRateAt v h = (int r / 1_000_000) / int (chainCountAt v h)
+globalBlockDelayAt v h = (int r / 1_000_000) / int (chainCountAt v h)
   where
-    BlockRate r = _versionBlockRate (_chainwebVersion v)
+    BlockDelay r = _versionBlockDelay (_chainwebVersion v)
 
 -- -------------------------------------------------------------------------- --
 -- Cut Heights
@@ -395,7 +405,7 @@ expectedBlockCountAfterSeconds v cid s = max 0 (1 + (int s / (int r / 1_000_000)
     -- The `max 0` term is required for chains that were added during graph transitions
     -- and thus have `genesisHeight > 0`
   where
-    BlockRate r = _versionBlockRate (_chainwebVersion v)
+    BlockDelay r = _versionBlockDelay (_chainwebVersion v)
     gh = genesisHeight (_chainwebVersion v) (_chainId cid)
 
 -- | This function is useful for performance testing when calculating the
@@ -431,7 +441,7 @@ expectedBlockHeightAfterSeconds
     -> Double
 expectedBlockHeightAfterSeconds v s = int s / (int r / 1_000_000)
   where
-    BlockRate r = _versionBlockRate (_chainwebVersion v)
+    BlockDelay r = _versionBlockDelay (_chainwebVersion v)
 
 -- | The expected CutHeight after the given number of seconds has passed.
 --
@@ -446,3 +456,26 @@ expectedCutHeightAfterSeconds
 expectedCutHeightAfterSeconds v s = eh * int (chainCountAt v (round eh))
   where
     eh = expectedBlockHeightAfterSeconds v s
+
+-- | The verifier plugins enabled for a particular block.
+verifiersAt :: ChainwebVersion -> ChainId -> BlockHeight -> Map VerifierName VerifierPlugin
+verifiersAt v cid bh =
+    M.restrictKeys allVerifierPlugins activeVerifierNames
+    where
+    activeVerifierNames =
+        case measureRule bh $ _versionVerifierPluginNames v ^?! onChain cid of
+            Bottom vs -> vs
+            Top (_, vs) -> vs
+            Between (_, vs) _ -> vs
+
+-- the mappings from names to verifier plugins is global. the list of verifier
+-- plugins active in any particular block validation context is the only thing
+-- that varies. this pedantry is only so that ChainwebVersion is plain data
+-- with no functions inside.
+allVerifierPlugins :: Map VerifierName VerifierPlugin
+allVerifierPlugins = M.fromList $ map (over _1 VerifierName)
+    [ ("allow", Chainweb.VerifierPlugin.Allow.plugin)
+
+    , ("hyperlane_v3_announcement", Chainweb.VerifierPlugin.Hyperlane.Announcement.plugin)
+    , ("hyperlane_v3_message", Chainweb.VerifierPlugin.Hyperlane.Message.plugin)
+    ]

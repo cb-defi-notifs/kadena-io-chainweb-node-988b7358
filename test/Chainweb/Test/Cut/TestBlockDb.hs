@@ -21,7 +21,6 @@ module Chainweb.Test.Cut.TestBlockDb
 
 import Control.Concurrent.MVar
 import Control.Monad.Catch
-import Data.Bifunctor (first)
 import qualified Data.HashMap.Strict as HM
 
 import Chainweb.BlockHeader
@@ -29,7 +28,7 @@ import Chainweb.BlockHeaderDB
 import Chainweb.ChainId
 import Chainweb.Cut
 import Chainweb.Test.Utils (testRocksDb)
-import Chainweb.Test.Cut (GenBlockTime, testMine')
+import Chainweb.Test.Cut (GenBlockTime, testMine', MineFailure(BadAdjacents))
 import Chainweb.Payload
 import Chainweb.Payload.PayloadStore
 import Chainweb.Payload.PayloadStore.RocksDB
@@ -37,14 +36,17 @@ import Chainweb.Utils
 import Chainweb.Version
 import Chainweb.WebBlockHeaderDB
 
-import Chainweb.Storage.Table
 import Chainweb.Storage.Table.RocksDB
+import Chainweb.BlockHeight
 
 data TestBlockDb = TestBlockDb
   { _bdbWebBlockHeaderDb :: WebBlockHeaderDb
   , _bdbPayloadDb :: PayloadDb RocksDbTable
   , _bdbCut :: MVar Cut
   }
+
+instance HasChainwebVersion TestBlockDb where
+  _chainwebVersion = _chainwebVersion . _bdbWebBlockHeaderDb
 
 -- | Initialize TestBlockDb.
 withTestBlockDb :: ChainwebVersion -> (TestBlockDb -> IO a) -> IO a
@@ -64,13 +66,35 @@ mkTestBlockDb cv rdb = do
     return $! TestBlockDb wdb pdb initCut
 
 -- | Add a block.
-addTestBlockDb :: TestBlockDb -> Nonce -> GenBlockTime -> ChainId -> PayloadWithOutputs -> IO ()
-addTestBlockDb (TestBlockDb wdb pdb cmv) n gbt cid outs = do
+--
+-- Returns False when mining fails due to BadAdjacents, which usually means that
+-- the chain is blocked. Retry with another chain!
+--
+addTestBlockDb
+    :: TestBlockDb
+    -> BlockHeight
+    -> Nonce
+    -> GenBlockTime
+    -> ChainId
+    -> PayloadWithOutputs
+    -> IO Bool
+addTestBlockDb (TestBlockDb wdb pdb cmv) bh n gbt cid outs = do
   c <- takeMVar cmv
   r <- testMine' wdb n gbt (_payloadWithOutputsPayloadHash outs) cid c
-  (T2 _ c') <- fromEitherM $ first (userError . show) $ r
-  casInsert pdb outs
-  putMVar cmv c'
+  case r of
+    -- success
+    Right (T2 _ c') -> do
+        addNewPayload pdb bh outs
+        putMVar cmv c'
+        return True
+
+    -- mining failed, probably because chain is blocked
+    Left BadAdjacents -> do
+        putMVar cmv c
+        return False
+
+    -- something went wrong
+    Left e -> throwM $ userError ("addTestBlockDb: " <> show e)
 
 -- | Get header for chain on current cut.
 getParentTestBlockDb :: TestBlockDb -> ChainId -> IO BlockHeader

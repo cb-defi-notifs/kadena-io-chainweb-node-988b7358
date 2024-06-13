@@ -9,6 +9,7 @@ module Chainweb.Version.Testnet(testnet, pattern Testnet04) where
 
 import Control.Lens
 import qualified Data.HashMap.Strict as HM
+import qualified Data.Set as Set
 
 import Chainweb.BlockCreationTime
 import Chainweb.BlockHeight
@@ -21,9 +22,13 @@ import Chainweb.Utils.Rule
 import Chainweb.Version
 import P2P.BootstrapNodes
 
+import Pact.Types.Runtime (Gas(..))
+import Pact.Types.Verifier
+
 import qualified Chainweb.Pact.Transactions.CoinV3Transactions as CoinV3
 import qualified Chainweb.Pact.Transactions.CoinV4Transactions as CoinV4
 import qualified Chainweb.Pact.Transactions.CoinV5Transactions as CoinV5
+import qualified Chainweb.Pact.Transactions.CoinV6Transactions as CoinV6
 import qualified Chainweb.Pact.Transactions.Mainnet0Transactions as MN0
 import qualified Chainweb.Pact.Transactions.Mainnet1Transactions as MN1
 import qualified Chainweb.Pact.Transactions.Mainnet2Transactions as MN2
@@ -36,15 +41,15 @@ import qualified Chainweb.Pact.Transactions.Mainnet8Transactions as MN8
 import qualified Chainweb.Pact.Transactions.Mainnet9Transactions as MN9
 import qualified Chainweb.Pact.Transactions.MainnetKADTransactions as MNKAD
 import qualified Chainweb.BlockHeader.Genesis.Testnet0Payload as PN0
-import qualified Chainweb.BlockHeader.Genesis.TestnetNPayload as PNN
+import qualified Chainweb.BlockHeader.Genesis.Testnet1to19Payload as PNN
 
 -- | Initial hash target for testnet 20-chain transition. Based on the following
--- header from devnet running with 5 GPUs hash power. Using this target unchanged
+-- header from recap devnet running with 5 GPUs hash power. Using this target unchanged
 -- means, that we should do to the transition with the hash power of about
 -- 5 - 50 GPUs in the system for a smooth transition.
 --
 -- The value for the initial target is 38 times smaller larger than value of an
--- successful test run on devnet with 5 GPUs. During that test the initial
+-- successful test run on recap devnet with 5 GPUs. During that test the initial
 -- target was about 32 times larger than the actual target at the time of the
 -- transition.
 --
@@ -64,7 +69,7 @@ import qualified Chainweb.BlockHeader.Genesis.TestnetNPayload as PNN
 --     "3": "9WIBnxDGGZsy9FCCorvAUa4SlE5Rqs-cTLEsWCPOVbQ"
 --   },
 --   "payloadHash": "AOYQdE5xl_YueZSppW4MoadasjF149K28CON2GuH9Mc",
---   "chainwebVersion": "development",
+--   "chainwebVersion": "recap-development",
 --   "target": "NZIklpW6xujSPrX3gyhXInfxxOS6JDjkW_GbGwAAAAA",
 --   "nonce": "5805155470630695"
 -- }
@@ -74,7 +79,7 @@ import qualified Chainweb.BlockHeader.Genesis.TestnetNPayload as PNN
 --
 -- prop> Just testnet20InitialHashTarget == HashTarget <$> (runGet decodePowHashNat =<< decodeB64UrlNoPaddingText "NZIklpW6xujSPrX3gyhXInfxxOS6JDjkW_GbGwAAAAA")
 -- prop> _hashTarget testnet20InitialHashTarget `div` _hashTarget mainnet20InitialHashTarget == PowHashNat 8893
--- prop> _hashTarget (genesisBlockTarget Development (unsafeChainId 10)) `div` _hashTarget testnet20InitialHashTarget == PowHashNat 38
+-- prop> _hashTarget (genesisBlockTarget RecapDevelopment (unsafeChainId 10)) `div` _hashTarget testnet20InitialHashTarget == PowHashNat 38
 --
 testnet20InitialHashTarget :: HashTarget
 testnet20InitialHashTarget = HashTarget 0x000000001b9bf15be43824bae4c4f17722572883f7b53ed2e8c6ba9596249235
@@ -92,42 +97,48 @@ testnet = ChainwebVersion
     { _versionCode = ChainwebVersionCode 0x00000007
     , _versionName = ChainwebVersionName "testnet04"
     , _versionForks = tabulateHashMap $ \case
-        SlowEpoch -> AllChains 0
-        Vuln797Fix -> AllChains 0
+        SlowEpoch -> AllChains ForkAtGenesis
+        Vuln797Fix -> AllChains ForkAtGenesis
         CoinV2 -> onChains $ concat
-            [ [(unsafeChainId i, BlockHeight 1) | i <- [0..9]]
-            , [(unsafeChainId i, BlockHeight 337_000) | i <- [10..19]]
+            [ [(unsafeChainId i, ForkAtBlockHeight $ BlockHeight 1) | i <- [0..9]]
+            , [(unsafeChainId i, ForkAtBlockHeight $ BlockHeight 337_000) | i <- [10..19]]
             ]
-        PactBackCompat_v16 -> AllChains 0
-        ModuleNameFix -> AllChains 2
-        SkipTxTimingValidation -> AllChains 1
-        OldTargetGuard -> AllChains 0
-        SkipFeatureFlagValidation -> AllChains 0
-        ModuleNameFix2 -> AllChains 289_966 -- ~ 2020-07-13
-        OldDAGuard -> AllChains 318_204 -- ~ 2020-07-23 16:00:00
-        PactEvents -> AllChains 660_000
-        SPVBridge -> AllChains 820_000 -- 2021-01-14T17:12:02
-        Pact4Coin3 -> AllChains 1_261_000  -- 2021-06-17T15:54:14
-        EnforceKeysetFormats -> AllChains 1_701_000 -- 2021-11-18T17:54:36
-        Pact420 -> AllChains 1_862_000  -- 2021-06-19T03:34:05
-        CheckTxHash -> AllChains 1_889_000 -- 2022-01-24T04:19:24
-        Chainweb213Pact -> AllChains 1_974_556  -- 2022-02-25 00:00:00
-        Chainweb214Pact -> AllChains 2_134_331  -- 2022-04-21T12:00:00Z
-        Chainweb215Pact -> AllChains 2_295_437  -- 2022-06-16T12:00:00+00:00
-        Pact44NewTrans -> AllChains 2_500_369 -- Todo: add date
-        Chainweb216Pact -> AllChains 2_516_739  -- 2022-09-01 12:00:00+00:00
-        Chainweb217Pact -> AllChains 2_777_367  -- 2022-12-01 12:00:00+00:00
-        Chainweb218Pact -> AllChains 3_038_343  -- 2023-03-02 12:00:00+00:00
-        Chainweb219Pact -> AllChains 3_299_753 -- 2023-06-01 12:00:00+00:00
+        PactBackCompat_v16 -> AllChains $ ForkAtBlockHeight $ BlockHeight 0
+        ModuleNameFix -> AllChains $ ForkAtBlockHeight $ BlockHeight 2
+        SkipTxTimingValidation -> AllChains $ ForkAtBlockHeight $ BlockHeight 1
+        OldTargetGuard -> AllChains $ ForkAtBlockHeight $ BlockHeight 0
+        SkipFeatureFlagValidation -> AllChains $ ForkAtBlockHeight $ BlockHeight 0
+        ModuleNameFix2 -> AllChains $ ForkAtBlockHeight $ BlockHeight 289_966 -- ~ 2020-07-13
+        OldDAGuard -> AllChains $ ForkAtBlockHeight $ BlockHeight 318_204 -- ~ 2020-07-23 16:00:00
+        PactEvents -> AllChains $ ForkAtBlockHeight $ BlockHeight 660_000
+        SPVBridge -> AllChains $ ForkAtBlockHeight $ BlockHeight 820_000 -- 2021-01-14T17:12:02
+        Pact4Coin3 -> AllChains $ ForkAtBlockHeight $ BlockHeight 1_261_000  -- 2021-06-17T15:54:14
+        EnforceKeysetFormats -> AllChains $ ForkAtBlockHeight $ BlockHeight 1_701_000 -- 2021-11-18T17:54:36
+        Pact42 -> AllChains $ ForkAtBlockHeight $ BlockHeight 1_862_000  -- 2021-06-19T03:34:05
+        CheckTxHash -> AllChains $ ForkAtBlockHeight $ BlockHeight 1_889_000 -- 2022-01-24T04:19:24
+        Chainweb213Pact -> AllChains $ ForkAtBlockHeight $ BlockHeight 1_974_556  -- 2022-02-25 00:00:00
+        Chainweb214Pact -> AllChains $ ForkAtBlockHeight $ BlockHeight 2_134_331  -- 2022-04-21T12:00:00Z
+        Chainweb215Pact -> AllChains $ ForkAtBlockHeight $ BlockHeight 2_295_437  -- 2022-06-16T12:00:00+00:00
+        Pact44NewTrans -> AllChains $ ForkAtBlockHeight $ BlockHeight 2_500_369 -- Todo: add date
+        Chainweb216Pact -> AllChains $ ForkAtBlockHeight $ BlockHeight 2_516_739  -- 2022-09-01 12:00:00+00:00
+        Chainweb217Pact -> AllChains $ ForkAtBlockHeight $ BlockHeight 2_777_367  -- 2022-12-01 12:00:00+00:00
+        Chainweb218Pact -> AllChains $ ForkAtBlockHeight $ BlockHeight 3_038_343  -- 2023-03-02 12:00:00+00:00
+        Chainweb219Pact -> AllChains $ ForkAtBlockHeight $ BlockHeight 3_299_753 -- 2023-06-01 12:00:00+00:00
+        Chainweb220Pact -> AllChains $ ForkAtBlockHeight $ BlockHeight 3_580_964 -- 2023-09-08 12:00:00+00:00
+        Chainweb221Pact -> AllChains $ ForkAtBlockHeight $ BlockHeight 3_702_250 -- 2023-10-19 12:00:00+00:00
+        Chainweb222Pact -> AllChains $ ForkAtBlockHeight $ BlockHeight 3_859_808 -- 2023-12-13 12:00:00+00:00
+        Chainweb223Pact -> AllChains $ ForkAtBlockHeight $ BlockHeight 4_100_681 -- 2024-03-06 12:00:00+00:00
+        Chainweb224Pact -> AllChains $ ForkAtBlockHeight $ BlockHeight 4_333_587 -- 2024-05-29 12:00:00+00:00
+        Chainweb225Pact -> AllChains ForkNever
 
     , _versionGraphs =
         (to20ChainsTestnet, twentyChainGraph) `Above`
         End petersonChainGraph
-    , _versionBlockRate = BlockRate 30_000_000
+    , _versionBlockDelay = BlockDelay 30_000_000
     , _versionWindow = WindowWidth 120
     , _versionHeaderBaseSizeBytes = 318 - 110
     , _versionMaxBlockGasLimit =
-        (succ $ testnet ^?! versionForks . at Chainweb216Pact . _Just . onChain (unsafeChainId 0), Just 180_000) `Above`
+        (succ $ testnet ^?! versionForks . at Chainweb216Pact . _Just . onChain (unsafeChainId 0) . _ForkAtBlockHeight, Just 180_000) `Above`
         End Nothing
     , _versionBootstraps = domainAddr2PeerInfo testnetBootstrapHosts
     , _versionGenesis = VersionGenesis
@@ -143,7 +154,7 @@ testnet = ChainwebVersion
             ]
         }
     , _versionUpgrades = chainZip HM.union
-        (forkUpgrades testnet
+        (indexByForkHeights testnet
         [ (CoinV2, onChains $
             [ (unsafeChainId 0, upgrade MN0.transactions)
             , (unsafeChainId 1, upgrade MN1.transactions)
@@ -159,6 +170,7 @@ testnet = ChainwebVersion
         , (Pact4Coin3, AllChains (Upgrade CoinV3.transactions True))
         , (Chainweb214Pact, AllChains (Upgrade CoinV4.transactions True))
         , (Chainweb215Pact, AllChains (Upgrade CoinV5.transactions True))
+        , (Chainweb223Pact, AllChains $ upgrade CoinV6.transactions)
         ])
         (onChains [(unsafeChainId 0, HM.singleton to20ChainsTestnet (upgrade MNKAD.transactions))])
     , _versionCheats = VersionCheats
@@ -169,5 +181,13 @@ testnet = ChainwebVersion
     , _versionDefaults = VersionDefaults
         { _disablePeerValidation = False
         , _disableMempoolSync = False
+        }
+    , _versionVerifierPluginNames = AllChains $ (4_100_681, Set.fromList $ map VerifierName ["hyperlane_v3_message"]) `Above`
+        End mempty
+    , _versionQuirks = VersionQuirks
+        { _quirkGasFees = HM.fromList
+            [ (fromJuste (decodeStrictOrThrow' "\"myHrgVbYCXlAk8KJbmWHs3TEDSlRKRuzxpFa9yaC7cQ\""), Gas 66239)
+            , (fromJuste (decodeStrictOrThrow' "\"3fpFnFUrRsu67ItHicBGa9PVlWp71AggrcWoikht3jk\""), Gas 65130)
+            ]
         }
     }

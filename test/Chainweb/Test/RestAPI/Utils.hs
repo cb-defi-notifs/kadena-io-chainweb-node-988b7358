@@ -9,6 +9,9 @@ module Chainweb.Test.RestAPI.Utils
 
   -- * Utils
 , repeatUntil
+, clientErrorStatusCode
+, isFailureResponse
+, getStatusCode
 
   -- * Pact client DSL
 , PactTestFailure(..)
@@ -19,6 +22,8 @@ module Chainweb.Test.RestAPI.Utils
 , ethSpv
 , sending
 , polling
+, pollingWithDepth
+, getCurrentBlockHeight
 
   -- * Rosetta client DSL
 , RosettaTestException(..)
@@ -48,7 +53,10 @@ import Control.Retry
 import Data.Either
 import Data.Foldable (toList)
 import Data.Text (Text)
+import Data.Maybe (fromJust)
+import qualified Data.HashMap.Strict as HM
 import qualified Data.Text as T
+import Network.HTTP.Types.Status (Status(..))
 
 import Rosetta
 
@@ -56,19 +64,20 @@ import Servant.Client
 
 -- internal chainweb modules
 
+import Chainweb.BlockHeight
 import Chainweb.ChainId
-import Chainweb.Graph
+import Chainweb.Cut.CutHashes (_cutHashes, _bhwhHeight)
+import Chainweb.CutDB.RestAPI.Client
 import Chainweb.Pact.RestAPI.Client
 import Chainweb.Pact.RestAPI.EthSpv
 import Chainweb.Pact.Service.Types
 import Chainweb.Rosetta.RestAPI.Client
-import Chainweb.Utils
 import Chainweb.Version
-import Chainweb.Test.TestVersions
 import Chainweb.Test.Utils
 
 -- internal pact modules
 
+import qualified Pact.JSON.Encode as J
 import Pact.Types.API
 import Pact.Types.Command
 import Pact.Types.Hash
@@ -83,9 +92,6 @@ debug = putStrLn
 debug = const $ return ()
 #endif
 
-v :: ChainwebVersion
-v = fastForkingCpmTestVersion petersonChainGraph
-
 -- ------------------------------------------------------------------ --
 -- Pact api client utils w/ retry
 
@@ -95,6 +101,7 @@ data PactTestFailure
     | SendFailure String
     | LocalFailure String
     | SpvFailure String
+    | GetBlockHeightFailure String
     deriving Show
 
 instance Exception PactTestFailure
@@ -110,14 +117,15 @@ repeatUntil test action = retrying testRetryPolicy
 -- | Calls to /local via the pact local api client with retry
 --
 localWithQueryParams
-    :: ChainId
+    :: ChainwebVersion
+    -> ChainId
     -> ClientEnv
     -> Maybe LocalPreflightSimulation
     -> Maybe LocalSignatureVerification
     -> Maybe RewindDepth
     -> Command Text
     -> IO LocalResult
-localWithQueryParams sid cenv pf sv rd cmd =
+localWithQueryParams v sid cenv pf sv rd cmd =
     recovering testRetryPolicy [h] $ \s -> do
       debug
         $ "requesting local cmd for " <> take 19 (show cmd)
@@ -137,32 +145,35 @@ localWithQueryParams sid cenv pf sv rd cmd =
 -- turned off. Retries.
 --
 local
-    :: ChainId
+    :: ChainwebVersion
+    -> ChainId
     -> ClientEnv
     -> Command Text
     -> IO (CommandResult Hash)
-local sid cenv cmd = do
+local v sid cenv cmd = do
     LocalResultLegacy cr <-
-      localWithQueryParams sid cenv Nothing Nothing Nothing cmd
+      localWithQueryParams v sid cenv Nothing Nothing Nothing cmd
     pure cr
 
 localTestToRetry
-    :: ChainId
+    :: ChainwebVersion
+    -> ChainId
     -> ClientEnv
     -> Command Text
     -> (CommandResult Hash -> Bool)
     -> IO (CommandResult Hash)
-localTestToRetry sid cenv cmd test =
-    repeatUntil (return . test) (local sid cenv cmd)
+localTestToRetry v sid cenv cmd test =
+    repeatUntil (return . test) (local v sid cenv cmd)
 
 -- | Request an SPV proof using exponential retry logic
 --
 spv
-    :: ChainId
+    :: ChainwebVersion
+    -> ChainId
     -> ClientEnv
     -> SpvRequest
     -> IO TransactionOutputProofB64
-spv sid cenv r =
+spv v sid cenv r =
     recovering testRetryPolicy [h] $ \s -> do
       debug
         $ "requesting spv proof for " <> show r
@@ -181,11 +192,12 @@ spv sid cenv r =
 -- | Request an Eth SPV proof using exponential retry logic
 --
 ethSpv
-    :: ChainId
+    :: ChainwebVersion
+    -> ChainId
     -> ClientEnv
     -> EthSpvRequest
     -> IO EthSpvResponse
-ethSpv sid cenv r =
+ethSpv v sid cenv r =
     recovering testRetryPolicy [h] $ \s -> do
       debug
         $ "requesting eth-spv proof for " <> show (_ethSpvReqTransactionHash r)
@@ -203,11 +215,12 @@ ethSpv sid cenv r =
 
 -- | Send a batch with retry logic waiting for success.
 sending
-    :: ChainId
+    :: ChainwebVersion
+    -> ChainId
     -> ClientEnv
     -> SubmitBatch
     -> IO RequestKeys
-sending sid cenv batch =
+sending v sid cenv batch =
     recovering testRetryPolicy [h] $ \s -> do
       debug
         $ "sending requestkeys " <> show (_cmdHash <$> toList ss)
@@ -231,12 +244,24 @@ sending sid cenv batch =
 data PollingExpectation = ExpectPactError | ExpectPactResult
 
 polling
-    :: ChainId
+    :: ChainwebVersion
+    -> ChainId
     -> ClientEnv
     -> RequestKeys
     -> PollingExpectation
     -> IO PollResponses
-polling sid cenv rks pollingExpectation =
+polling v sid cenv rks pollingExpectation =
+  pollingWithDepth v sid cenv rks Nothing pollingExpectation
+
+pollingWithDepth
+    :: ChainwebVersion
+    -> ChainId
+    -> ClientEnv
+    -> RequestKeys
+    -> Maybe ConfirmationDepth
+    -> PollingExpectation
+    -> IO PollResponses
+pollingWithDepth v sid cenv rks confirmationDepth pollingExpectation =
     recovering testRetryPolicy [h] $ \s -> do
       debug
         $ "polling for requestkeys " <> show (toList rs)
@@ -246,12 +271,12 @@ polling sid cenv rks pollingExpectation =
       -- by making sure results are successful and request keys
       -- are sane
 
-      runClientM (pactPollApiClient v sid $ Poll rs) cenv >>= \case
+      runClientM (pactPollWithQueryApiClient v sid confirmationDepth $ Poll rs) cenv >>= \case
         Left e -> throwM $ PollingFailure (show e)
         Right r@(PollResponses mp) ->
           if all (go mp) (toList rs)
           then return r
-          else throwM $ PollingFailure $ T.unpack $ "polling check failed: " <> encodeToText r
+          else throwM $ PollingFailure $ T.unpack $ "polling check failed: " <> J.encodeText r
   where
     h _ = Handler $ \case
       PollingFailure _ -> return True
@@ -267,6 +292,11 @@ polling sid cenv rks pollingExpectation =
       Just cr ->  _crReqKey cr == rk && validate (_crResult cr)
       Nothing -> False
 
+getCurrentBlockHeight :: ChainwebVersion -> ClientEnv -> ChainId -> IO BlockHeight
+getCurrentBlockHeight сv cenv cid =
+  runClientM (cutGetClient сv) cenv >>= \case
+    Left e -> throwM $ GetBlockHeightFailure $ "Failed to get cuts: " ++ show e
+    Right cuts -> return $ fromJust $ _bhwhHeight <$> HM.lookup cid (_cutHashes cuts)
 
 -- ------------------------------------------------------------------ --
 -- Rosetta api client utils w/ retry
@@ -292,10 +322,11 @@ data RosettaTestException
 instance Exception RosettaTestException
 
 accountBalance
-    :: ClientEnv
+    :: ChainwebVersion
+    -> ClientEnv
     -> AccountBalanceReq
     -> IO AccountBalanceResp
-accountBalance cenv req =
+accountBalance v cenv req =
     recovering testRetryPolicy [h] $ \s -> do
     debug
       $ "requesting account balance for " <> show req
@@ -310,10 +341,11 @@ accountBalance cenv req =
       _ -> return False
 
 blockTransaction
-    :: ClientEnv
+    :: ChainwebVersion
+    -> ClientEnv
     -> BlockTransactionReq
     -> IO BlockTransactionResp
-blockTransaction cenv req =
+blockTransaction v cenv req =
     recovering testRetryPolicy [h] $ \s -> do
     debug
       $ "requesting block transaction for " <> show req
@@ -328,10 +360,11 @@ blockTransaction cenv req =
       _ -> return False
 
 block
-    :: ClientEnv
+    :: ChainwebVersion
+    -> ClientEnv
     -> BlockReq
     -> IO BlockResp
-block cenv req =
+block v cenv req =
     recovering testRetryPolicy [h] $ \s -> do
     debug
       $ "requesting block for " <> show req
@@ -346,10 +379,11 @@ block cenv req =
       _ -> return False
 
 constructionDerive
-    :: ClientEnv
+    :: ChainwebVersion
+    -> ClientEnv
     -> ConstructionDeriveReq
     -> IO ConstructionDeriveResp
-constructionDerive cenv req =
+constructionDerive v cenv req =
   recovering testRetryPolicy [h] $ \s -> do
     debug
       $ "requesting derive preprocess for " <> (show req)
@@ -364,10 +398,11 @@ constructionDerive cenv req =
       _ -> return False
 
 constructionPreprocess
-    :: ClientEnv
+    :: ChainwebVersion
+    -> ClientEnv
     -> ConstructionPreprocessReq
     -> IO ConstructionPreprocessResp
-constructionPreprocess cenv req =
+constructionPreprocess v cenv req =
   recovering testRetryPolicy [h] $ \s -> do
     debug
       $ "requesting construction preprocess for " <> (show req)
@@ -382,10 +417,11 @@ constructionPreprocess cenv req =
       _ -> return False
 
 constructionMetadata
-    :: ClientEnv
+    :: ChainwebVersion
+    -> ClientEnv
     -> ConstructionMetadataReq
     -> IO ConstructionMetadataResp
-constructionMetadata cenv req =
+constructionMetadata v cenv req =
     recovering testRetryPolicy [h] $ \s -> do
     debug
       $ "requesting construction metadata for " <> show req
@@ -400,10 +436,11 @@ constructionMetadata cenv req =
       _ -> return False
 
 constructionPayloads
-    :: ClientEnv
+    :: ChainwebVersion
+    -> ClientEnv
     -> ConstructionPayloadsReq
     -> IO ConstructionPayloadsResp
-constructionPayloads cenv req =
+constructionPayloads v cenv req =
   recovering testRetryPolicy [h] $ \s -> do
     debug
       $ "requesting construction payloads for " <> (show req)
@@ -418,10 +455,11 @@ constructionPayloads cenv req =
       _ -> return False
 
 constructionParse
-    :: ClientEnv
+    :: ChainwebVersion
+    -> ClientEnv
     -> ConstructionParseReq
     -> IO ConstructionParseResp
-constructionParse cenv req =
+constructionParse v cenv req =
   recovering testRetryPolicy [h] $ \s -> do
     debug
       $ "requesting construction parse for " <> (show req)
@@ -436,10 +474,11 @@ constructionParse cenv req =
       _ -> return False
 
 constructionCombine
-    :: ClientEnv
+    :: ChainwebVersion
+    -> ClientEnv
     -> ConstructionCombineReq
     -> IO ConstructionCombineResp
-constructionCombine cenv req =
+constructionCombine v cenv req =
   recovering testRetryPolicy [h] $ \s -> do
     debug
       $ "requesting construction combine for " <> (show req)
@@ -454,10 +493,11 @@ constructionCombine cenv req =
       _ -> return False
 
 constructionHash
-    :: ClientEnv
+    :: ChainwebVersion
+    -> ClientEnv
     -> ConstructionHashReq
     -> IO TransactionIdResp
-constructionHash cenv req =
+constructionHash v cenv req =
   recovering testRetryPolicy [h] $ \s -> do
     debug
       $ "requesting construction hash for " <> (show req)
@@ -472,10 +512,11 @@ constructionHash cenv req =
       _ -> return False
 
 constructionSubmit
-    :: ClientEnv
+    :: ChainwebVersion
+    -> ClientEnv
     -> ConstructionSubmitReq
     -> IO TransactionIdResp
-constructionSubmit cenv req =
+constructionSubmit v cenv req =
     recovering testRetryPolicy [h] $ \s -> do
     debug
       $ "requesting construction submit for " <> show req
@@ -490,10 +531,11 @@ constructionSubmit cenv req =
       _ -> return False
 
 mempoolTransaction
-    :: ClientEnv
+    :: ChainwebVersion
+    -> ClientEnv
     -> MempoolTransactionReq
     -> IO MempoolTransactionResp
-mempoolTransaction cenv req =
+mempoolTransaction v cenv req =
     recovering testRetryPolicy [h] $ \s -> do
     debug
       $ "requesting mempool transaction for " <> show req
@@ -508,10 +550,11 @@ mempoolTransaction cenv req =
       _ -> return False
 
 mempool
-    :: ClientEnv
+    :: ChainwebVersion
+    -> ClientEnv
     -> NetworkReq
     -> IO MempoolResp
-mempool cenv req =
+mempool v cenv req =
     recovering testRetryPolicy [h] $ \s -> do
     debug
       $ "requesting mempool for " <> show req
@@ -526,10 +569,11 @@ mempool cenv req =
       _ -> return False
 
 networkList
-    :: ClientEnv
+    :: ChainwebVersion
+    -> ClientEnv
     -> MetadataReq
     -> IO NetworkListResp
-networkList cenv req =
+networkList v cenv req =
     recovering testRetryPolicy [h] $ \s -> do
     debug
       $ "requesting network list for " <> show req
@@ -544,10 +588,11 @@ networkList cenv req =
       _ -> return False
 
 networkOptions
-    :: ClientEnv
+    :: ChainwebVersion
+    -> ClientEnv
     -> NetworkReq
     -> IO NetworkOptionsResp
-networkOptions cenv req =
+networkOptions v cenv req =
     recovering testRetryPolicy [h] $ \s -> do
     debug
       $ "requesting network options for " <> show req
@@ -562,10 +607,11 @@ networkOptions cenv req =
       _ -> return False
 
 networkStatus
-    :: ClientEnv
+    :: ChainwebVersion
+    -> ClientEnv
     -> NetworkReq
     -> IO NetworkStatusResp
-networkStatus cenv req =
+networkStatus v cenv req =
     recovering testRetryPolicy [h] $ \s -> do
     debug
       $ "requesting network status for " <> show req
@@ -578,3 +624,19 @@ networkStatus cenv req =
     h _ = Handler $ \case
       NetworkStatusFailure _ -> return True
       _ -> return False
+
+clientErrorStatusCode :: ClientError -> Maybe Int
+clientErrorStatusCode = \case
+  FailureResponse _ resp -> Just $ getStatusCode resp
+  DecodeFailure _ resp -> Just $ getStatusCode resp
+  UnsupportedContentType _ resp -> Just $ getStatusCode resp
+  InvalidContentTypeHeader resp -> Just $ getStatusCode resp
+  ConnectionError _ -> Nothing
+
+isFailureResponse :: ClientError -> Bool
+isFailureResponse = \case
+  FailureResponse {} -> True
+  _ -> False
+
+getStatusCode :: ResponseF a -> Int
+getStatusCode resp = statusCode (responseStatusCode resp)

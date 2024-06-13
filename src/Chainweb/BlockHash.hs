@@ -16,7 +16,6 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE TypeInType #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
 
@@ -40,6 +39,7 @@ module Chainweb.BlockHash
 , decodeBlockHash
 , nullBlockHash
 , blockHashToText
+, blockHashToTextShort
 , blockHashFromText
 
 -- * Block Hash Record
@@ -154,6 +154,9 @@ nullBlockHash = BlockHash nullHashBytes
 blockHashToText :: BlockHash_ a -> T.Text
 blockHashToText = encodeB64UrlNoPaddingText . runPutS . encodeBlockHash
 {-# INLINE blockHashToText #-}
+
+blockHashToTextShort :: BlockHash_ a -> T.Text
+blockHashToTextShort = T.take 6 . blockHashToText
 
 blockHashFromText
     :: MerkleHashAlgorithm a

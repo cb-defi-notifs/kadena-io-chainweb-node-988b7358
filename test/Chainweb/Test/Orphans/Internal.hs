@@ -1,15 +1,11 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE DeriveTraversable #-}
-{-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
@@ -57,6 +53,7 @@ module Chainweb.Test.Orphans.Internal
 , mkTestEventsProof
 , arbitraryEventsProof
 , EventPactValue(..)
+, ProofPactEvent(..)
 
 -- ** Misc
 , arbitraryPage
@@ -87,10 +84,12 @@ import GHC.Stack
 
 import Numeric.Natural
 
-import Pact.Parse
+import qualified Pact.JSON.Encode as J
 import Pact.Types.Command
 import Pact.Types.PactValue
 import Pact.Types.Runtime (PactEvent(..), Literal(..))
+
+import Prelude hiding (Applicative(..))
 
 import System.IO.Unsafe
 
@@ -146,7 +145,7 @@ import Chainweb.Utils
 import Chainweb.Utils.Paging
 import Chainweb.Utils.Serialization
 import Chainweb.Version
-import Chainweb.Version.Development
+import Chainweb.Version.RecapDevelopment
 import Chainweb.Version.Mainnet
 import Chainweb.Version.Registry
 import Chainweb.Version.Testnet
@@ -191,7 +190,7 @@ instance Arbitrary ChainwebVersion where
         , timedConsensusVersion petersonChainGraph petersonChainGraph
         , timedConsensusVersion singletonChainGraph pairChainGraph
         , timedConsensusVersion petersonChainGraph twentyChainGraph
-        , Development
+        , RecapDevelopment
         , Testnet04
         , Mainnet01
         ]
@@ -243,7 +242,6 @@ instance Arbitrary PeerEntry where
 
 instance Arbitrary HostAddressIdx where
     arbitrary = hostAddressIdx <$> arbitrary
-    {-# INLINE arbitrary #-}
 
 deriving newtype instance Arbitrary LastSuccess
 deriving newtype instance Arbitrary SuccessiveFailures
@@ -324,7 +322,6 @@ instance Arbitrary FeatureFlags where
 
 instance Arbitrary BlockHeader where
     arbitrary = arbitrary >>= arbitraryBlockHeaderVersion
-    {-# INLINE arbitrary #-}
 
 arbitraryBlockHashRecordVersionHeightChain
     :: ChainwebVersion
@@ -346,7 +343,6 @@ arbitraryBlockHeaderVersion :: ChainwebVersion -> Gen BlockHeader
 arbitraryBlockHeaderVersion v = do
     h <- arbitrary
     arbitraryBlockHeaderVersionHeight v h
-{-# INLINE arbitraryBlockHeaderVersion #-}
 
 arbitraryBlockHeaderVersionHeight
     :: ChainwebVersion
@@ -355,7 +351,6 @@ arbitraryBlockHeaderVersionHeight
 arbitraryBlockHeaderVersionHeight v h = do
     cid <- elements $ toList $ chainIdsAt v h
     arbitraryBlockHeaderVersionHeightChain v h cid
-{-# INLINE arbitraryBlockHeaderVersionHeight #-}
 
 arbitraryBlockHeaderVersionHeightChain
     :: ChainwebVersion
@@ -389,6 +384,7 @@ instance Arbitrary HeaderUpdate where
         <*> arbitrary
         <*> arbitrary
         <*> arbitrary
+        <*> arbitrary
 
 instance Arbitrary BlockHashWithHeight where
     arbitrary = BlockHashWithHeight <$> arbitrary <*> arbitrary
@@ -407,6 +403,7 @@ instance Arbitrary CutHashes where
     arbitrary = CutHashes
         <$> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary
         <*> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary
+        <*> return Nothing
 
 instance Arbitrary CutHeight where
     arbitrary = CutHeight <$> arbitrary
@@ -681,7 +678,7 @@ arbitraryPayloadWithStructuredOutputs = resize 10 $ do
     payloads <- newPayloadWithOutputs
         <$> arbitrary
         <*> arbitrary
-        <*> pure (fmap (TransactionOutput . encodeToByteString) <$> txs)
+        <*> pure (fmap (TransactionOutput . J.encodeStrict) <$> txs)
     return (_crReqKey . snd <$> txs, payloads)
   where
     genResult = arbitraryCommandResultWithEvents arbitraryProofPactEvent
@@ -778,6 +775,9 @@ instance Arbitrary NetworkId where
 instance Arbitrary ChainId where
     arbitrary = unsafeChainId <$> arbitrary
 
+instance Arbitrary Fork where
+    arbitrary = elements [minBound..maxBound]
+
 instance Arbitrary ChainDatabaseGcConfig where
     arbitrary = elements
         [ GcNone
@@ -854,8 +854,18 @@ arbitraryOutputEvents = OutputEvents
 instance Arbitrary OutputEvents where
     arbitrary = arbitraryOutputEvents
 
-instance Arbitrary PactEvent where
-    arbitrary = arbitraryProofPactEvent
+-- | Events that are supported in proofs
+--
+newtype ProofPactEvent = ProofPactEvent { getProofPactEvent :: PactEvent }
+    deriving (Show)
+    deriving newtype (Eq, FromJSON)
+
+instance ToJSON ProofPactEvent where
+    toJSON = J.toJsonViaEncode . getProofPactEvent
+    {-# INLINEABLE toJSON #-}
+
+instance Arbitrary ProofPactEvent where
+    arbitrary = ProofPactEvent <$> arbitraryProofPactEvent
 
 instance MerkleHashAlgorithm a => Arbitrary (BlockEventsHash_ a) where
     arbitrary = BlockEventsHash <$> arbitrary
@@ -864,6 +874,8 @@ instance Arbitrary Int256 where
     arbitrary = unsafeInt256
         <$> choose (int256ToInteger minBound, int256ToInteger maxBound)
 
+-- | PactValues that are supported in Proofs
+--
 newtype EventPactValue = EventPactValue { getEventPactValue :: PactValue }
     deriving (Show, Eq, Ord)
 
@@ -935,18 +947,6 @@ instance Arbitrary PendingTransactions where
 
 instance Arbitrary TransactionMetadata where
     arbitrary = TransactionMetadata <$> arbitrary <*> arbitrary
-
-instance Arbitrary ParsedDecimal where
-    arbitrary = ParsedDecimal <$> arbitrary
-
-instance Arbitrary ParsedInteger where
-    arbitrary = ParsedInteger <$> arbitrary
-
-instance Arbitrary GasLimit where
-    arbitrary = GasLimit <$> (getPositive <$> arbitrary)
-
-instance Arbitrary GasPrice where
-    arbitrary = GasPrice <$> (getPositive <$> arbitrary)
 
 instance Arbitrary t => Arbitrary (ValidatedTransaction t) where
     arbitrary = ValidatedTransaction <$> arbitrary <*> arbitrary <*> arbitrary

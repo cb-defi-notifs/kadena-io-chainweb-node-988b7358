@@ -17,7 +17,6 @@ module Chainweb.Pact.Utils
     , toTxCreationTime
 
     -- * k:account helper functions
-    , validatePubKey
     , validateKAccount
     , extractPubKeyFromKAccount
     , generateKAccountFromPubKey
@@ -38,7 +37,9 @@ import Pact.Parse
 import qualified Pact.Types.ChainId as P
 import qualified Pact.Types.Term as P
 import Pact.Types.ChainMeta
-import Pact.Types.KeySet (validateKeyFormat)
+import Pact.Types.KeySet (ed25519HexFormat)
+
+import qualified Pact.JSON.Encode as J
 
 -- Internal modules
 
@@ -46,7 +47,6 @@ import Chainweb.ChainId
 import Chainweb.Miner.Pact
 import Chainweb.Payload
 import Chainweb.Time
-import Chainweb.Utils
 
 fromPactChainId :: MonadThrow m => P.ChainId -> m ChainId
 fromPactChainId (P.ChainId t) = chainIdFromText t
@@ -63,15 +63,13 @@ toTxCreationTime (Time timespan) =
   TxCreationTime $ ParsedInteger $ fromIntegral $ timeSpanToSeconds timespan
 
 
-validatePubKey :: P.PublicKeyText -> Bool
-validatePubKey = validateKeyFormat
 
 validateKAccount :: T.Text -> Bool
 validateKAccount acctName =
   case T.take 2 acctName of
     "k:" ->
       let pubKey = P.PublicKeyText $ T.drop 2 acctName
-      in validateKeyFormat pubKey
+      in ed25519HexFormat pubKey
     _ -> False
 
 extractPubKeyFromKAccount :: T.Text -> Maybe P.PublicKeyText
@@ -82,13 +80,15 @@ extractPubKeyFromKAccount kacct
 
 generateKAccountFromPubKey :: P.PublicKeyText -> Maybe T.Text
 generateKAccountFromPubKey pubKey
-  | validatePubKey pubKey =
+  | ed25519HexFormat pubKey =
     let pubKeyText = P._pubKey pubKey
     in Just $ "k:" <> pubKeyText
   | otherwise = Nothing
 
+
 -- Warning: Only use if already certain that PublicKeyText
 -- is valid.
+-- Note: We are assuming the k: account is ED25519.
 pubKeyToKAccountKeySet :: P.PublicKeyText -> P.KeySet
 pubKeyToKAccountKeySet pubKey = P.mkKeySet [pubKey] "keys-all"
 
@@ -108,8 +108,7 @@ validateKAccountKeySet kacct actualKeySet =
 -- | Empty payload marking no-op transaction payloads.
 --
 emptyPayload :: PayloadWithOutputs
-emptyPayload = PayloadWithOutputs mempty miner coinbase h i o
+emptyPayload = newPayloadWithOutputs miner coinbase mempty
   where
-    BlockPayload h i o = newBlockPayload miner coinbase mempty
-    miner = MinerData $ encodeToByteString noMiner
+    miner = MinerData $ J.encodeStrict noMiner
     coinbase = noCoinbaseOutput

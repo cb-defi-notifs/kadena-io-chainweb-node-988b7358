@@ -94,6 +94,7 @@ import Control.Lens
 import Control.Monad
 import Control.Monad.Catch
 import Control.Monad.Except
+import Control.Monad.Trans.Class
 
 import Data.Foldable
 import qualified Data.HashMap.Strict as HM
@@ -287,10 +288,10 @@ webStepFailure hp = ValidationFailure
 instance Show ValidationFailure where
     show (ValidationFailure p as e ts)
         = T.unpack $ "Validation failure"
-            <> ". Parent: " <> encodeToText (ObjectEncoded . _parentHeader <$> p)
-            <> ". Adjacents: " <> encodeToText ((fmap (ObjectEncoded . _parentHeader)) <$> as)
-            <> ". Header: " <> encodeToText (ObjectEncoded e)
             <> ". Description: " <> T.unlines (map description ts)
+            <> ". Header: " <> encodeToText (ObjectEncoded e)
+            <> maybe "" (\p' -> ". Parent: " <> encodeToText (ObjectEncoded $ _parentHeader p')) p
+            <> maybe "" (\as' -> ". Adjacents: " <> encodeToText (ObjectEncoded . _parentHeader <$> as')) as
       where
         description t = case t of
             MissingParent -> "Parent isn't in the database"

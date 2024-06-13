@@ -19,7 +19,6 @@ module Chainweb.Test.Pact.TransactionTests ( tests ) where
 import Test.Tasty
 import Test.Tasty.HUnit
 
-import Control.Applicative((<|>))
 import Control.Concurrent (readMVar)
 import Control.Lens hiding ((.=))
 import Control.Monad
@@ -31,6 +30,7 @@ import Data.Function (on)
 import Data.List (intercalate)
 import Data.Text (Text,isInfixOf,unpack)
 import Data.Default
+import qualified System.LogLevel as L
 
 -- internal pact modules
 
@@ -41,7 +41,6 @@ import Pact.Repl
 import Pact.Repl.Types
 import Pact.Types.Command
 import qualified Pact.Types.Hash as H
-import Pact.Types.Logger
 import Pact.Types.PactValue
 import Pact.Types.RPC
 import Pact.Types.Runtime
@@ -53,6 +52,7 @@ import Pact.Types.SPV
 import Chainweb.BlockCreationTime
 import Chainweb.BlockHeader
 import Chainweb.BlockHeight
+import Chainweb.Logger
 import Chainweb.Miner.Pact
 import Chainweb.Pact.Templates
 import Chainweb.Pact.TransactionExec
@@ -62,7 +62,7 @@ import Chainweb.Test.TestVersions
 import Chainweb.Time
 import Chainweb.Utils
 import Chainweb.Version as V
-import Chainweb.Version.Development
+import Chainweb.Version.RecapDevelopment
 import Chainweb.Version.Mainnet
 import Chainweb.Test.Pact.Utils
 
@@ -71,10 +71,10 @@ import Chainweb.Test.Pact.Utils
 -- Global settings
 
 v :: ChainwebVersion
-v = Development
+v = RecapDevelopment
 
 coinReplV1 :: FilePath
-coinReplV1 = "pact/coin-contract/coin.repl"
+coinReplV1 = "pact/coin-contract/v1/coin.repl"
 
 coinReplV4 :: FilePath
 coinReplV4 = "pact/coin-contract/v4/coin-v4.repl"
@@ -82,17 +82,20 @@ coinReplV4 = "pact/coin-contract/v4/coin-v4.repl"
 coinReplV5 :: FilePath
 coinReplV5 = "pact/coin-contract/v5/coin-v5.repl"
 
+coinReplV6 :: FilePath
+coinReplV6 = "pact/coin-contract/coin.repl"
+
 nsReplV1 :: FilePath
 nsReplV1 = "pact/namespaces/v1/ns.repl"
 
 nsReplV2 :: FilePath
 nsReplV2 = "pact/namespaces/ns.repl"
 
-logger :: Logger
+logger :: GenericLogger
 #if DEBUG_TEST
-logger = newLogger alwaysLog ""
+logger = genericLogger L.Info (step . T.unpack)
 #else
-logger = newLogger neverLog ""
+logger = genericLogger L.Error (\_ -> return ())
 #endif
 
 -- ---------------------------------------------------------------------- --
@@ -110,6 +113,7 @@ tests = testGroup "Chainweb.Test.Pact.TransactionTests"
         -- v2 and v3 repl tests were consolidated in v4
       , testCase "v4" (ccReplTests coinReplV4)
       , testCase "v5" (ccReplTests coinReplV5)
+      , testCase "v6" (ccReplTests coinReplV6)
       ]
     , testGroup "Namespace repl unit tests"
       [ testCase "Ns-v1 repl tests" $ ccReplTests nsReplV1
@@ -158,7 +162,7 @@ loadScript fp = do
             (view (rEnv . eePactDb) rst)
             (view (rEnv . eePactDbVar) rst)
       mc = view (rEvalState . evalRefs . rsLoadedModules) rst
-  return (pdb,mc)
+  return (pdb, moduleCacheFromHashMap mc)
 
 -- ---------------------------------------------------------------------- --
 -- Template vuln tests
@@ -257,11 +261,11 @@ testCoinbase797DateFix = testCaseSteps "testCoinbase791Fix" $ \step -> do
 
       let h = H.toUntypedHash (H.hash "" :: H.PactHash)
           tenv = TransactionEnv Transactional pdb logger Nothing def
-            noSPVSupport Nothing 0.0 (RequestKey h) 0 def
+            noSPVSupport Nothing 0.0 (RequestKey h) 0 def Nothing
           txst = TransactionState mempty mempty 0 Nothing (_geGasModel freeGasEnv) mempty
 
       CommandResult _ _ (PactResult pr) _ _ _ _ _ <- evalTransactionM tenv txst $!
-        applyExec 0 defaultInterpreter localCmd [] h permissiveNamespacePolicy
+        applyExec 0 defaultInterpreter localCmd [] [] h permissiveNamespacePolicy
 
       testResult pr
 
@@ -282,8 +286,10 @@ testCoinbase797DateFix = testCaseSteps "testCoinbase791Fix" $ \step -> do
 testCoinbaseEnforceFailure :: Assertion
 testCoinbaseEnforceFailure = do
     (pdb,mc) <- loadCC coinReplV4
-    r <- tryAllSynchronous $ applyCoinbase toyVersion logger pdb badMiner 0.1 (TxContext someParentHeader def)
-      (EnforceCoinbaseFailure True) (CoinbaseUsePrecompiled False) mc
+    r <- tryAllSynchronous $
+      applyCoinbase toyVersion logger pdb badMiner 0.1
+        (TxContext someParentHeader def)
+        (EnforceCoinbaseFailure True) (CoinbaseUsePrecompiled False) mc
     case r of
       Left e ->
         if isInfixOf "CoinbaseFailure" (sshow e) then
@@ -354,22 +360,25 @@ testUpgradeScript
     :: FilePath
     -> V.ChainId
     -> BlockHeight
-    -> (T2 (CommandResult [TxLog Value]) (Maybe ModuleCache) -> IO ())
+    -> (T2 (CommandResult [TxLogJson]) (Maybe ModuleCache) -> IO ())
     -> IO ()
 testUpgradeScript script cid bh test = do
     (pdb, mc) <- loadScript script
-    r <- tryAllSynchronous $ applyCoinbase v logger pdb noMiner 0.1 (TxContext p def)
+    r <- tryAllSynchronous $ applyCoinbase v logger pdb noMiner 0.1 (TxContext parent def)
         (EnforceCoinbaseFailure True) (CoinbaseUsePrecompiled False) mc
     case r of
       Left e -> assertFailure $ "tx execution failed: " ++ show e
       Right cr -> test cr
   where
-    p = parent bh cid
-
+    parent = ParentHeader (someBlockHeader v bh)
+        { _blockChainwebVersion = _versionCode v
+        , _blockChainId = cid
+        , _blockHeight = pred bh
+        }
 matchLogs :: [(Text, Text, Maybe Value)] -> [(Text, Text, Maybe Value)] -> IO ()
 matchLogs expectedResults actualResults
     | length actualResults /= length expectedResults = void $
-      assertFailure $ intercalate "\n" $
+      assertFailure $ intercalate "\n"
         [ "matchLogs: length mismatch "
           <> show (length actualResults) <> " /= " <> show (length expectedResults)
         , "actual: " ++ show actualResults
@@ -382,20 +391,16 @@ matchLogs expectedResults actualResults
       (assertEqual "key matches" `on` view _2) actual expected
       (assertEqual "balance matches" `on` view _3) actual expected
 
-parent :: BlockHeight -> V.ChainId -> ParentHeader
-parent bh cid = ParentHeader (someBlockHeader v bh)
-    { _blockChainwebVersion = _versionCode v
-    , _blockChainId = cid
-    , _blockHeight = pred bh
-    }
-
-logResults :: [TxLog Value] -> [(Text, Text, Maybe Value)]
-logResults = fmap f
+logResults :: [TxLogJson] -> [(Text, Text, Maybe Value)]
+logResults = fmap go
   where
+    go x = case decodeTxLogJson x of
+        Left e -> error $ "unable to parse TxLog: " <> show e
+        Right (r :: TxLog Value) -> f r
     f l =
       ( _txDomain l
       , _txKey l
       -- This lens is because some of the transacctions happen post 420 fork
       -- So the object representation changes due to the RowData type.
-      , l ^? txValue . _Object . ix "balance" <|> l ^? txValue . _Object . ix "$d" . _Object . ix "balance"
+      , l ^? txValue . _Object . (ix "balance" `failing` ix "$d" . _Object . ix "balance")
       )
